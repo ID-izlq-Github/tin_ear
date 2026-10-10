@@ -291,9 +291,15 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 ## 12. 环境准备
 
 ```bash
-sudo apt install ffmpeg
-pip install fastapi uvicorn python-multipart numpy scipy pyloudnorm soundfile
+# ffmpeg / ffprobe 用系统已有的 6.1.1，本项目不 apt install、不装任何全局包
+make install     # = pip install -r requirements.txt，装进本项目专用 conda 环境 tin_ear
+make run         # 前台启动（Ctrl+C 停止）；或 make run-bg 后台启动 + make stop 停止
+make test        # 49 项自动化测试
 ```
+
+- pip 缓存与临时文件都留在项目内（`.pip-cache/`、`data/tmp/`），不写系统 temp、`~/.cache`，
+  也不动 `base` 或其他项目的 conda 环境。
+- 依赖全是 wheel（`soundfile` 自带 libsndfile），不需要编译器或系统库。
 
 测试注意：关 Windows 音效增强、Dolby、EQ、空间音频；系统音量固定；WSL 不出声，用 Windows 浏览器访问 localhost 播放。
 
@@ -316,6 +322,7 @@ pip install fastapi uvicorn python-multipart numpy scipy pyloudnorm soundfile
 
 ```bash
 make test     # = TMPDIR=<项目>/data/tmp <tin_ear>/bin/python -m pytest -q
+make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 ```
 
 - `tests/conftest.py`：lavfi 合成音频（声部 + 粉噪 + 动态包络 + 瞬态，35 s / 65 s 两种）；
