@@ -14,6 +14,8 @@ const state = {
   index: 0,
   question: null,
   questionShownAt: 0,
+  answered: false,
+  lastAnswer: null,
   bufferCache: new Map(),
   busy: false,
   sampleRateWarned: false,
@@ -345,10 +347,33 @@ async function uploadFiles(fileList) {
 
 /* ---------------------------------------------------------------- 测试 */
 
+/* 结束会话：释放 session 目录与后端引用，之后才允许删除库里的音频。
+   beacon=true 用于页面关闭（sendBeacon 能在卸载过程中发出请求）。 */
+async function endSession({ beacon = false } = {}) {
+  const sessionId = state.sessionId;
+  if (!sessionId) return;
+  state.sessionId = null;
+  const payload = JSON.stringify({ session_id: sessionId });
+  if (beacon && navigator.sendBeacon) {
+    navigator.sendBeacon('/api/end', new Blob([payload], { type: 'application/json' }));
+    return;
+  }
+  try {
+    await api('/api/end', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: payload,
+    });
+  } catch (error) {
+    /* 会话可能已被 TTL 清理，忽略 */
+  }
+}
+
 async function startTest() {
   if (state.busy || !state.selected.size) return;
   state.busy = true;
   ensureAudioContext();
+  await endSession(); // 先收掉上一轮，避免留下"进行中"的引用
   const mode = document.querySelector('input[name="mode"]:checked').value;
   $('btn-start').disabled = true;
   setStatus('prepare-status', '正在准备测试：截取片段、生成并校准压缩版（首次可能要十几秒）…');
@@ -372,6 +397,21 @@ async function startTest() {
   }
 }
 
+function resetAnswerArea() {
+  state.answered = false;
+  state.lastAnswer = null;
+  document.querySelectorAll('.answer').forEach((button) => {
+    button.disabled = true; // 音频没载入完不让作答，避免污染 reaction_ms
+    button.classList.remove('selected', 'dim');
+  });
+  $('confirm-area').classList.add('hidden');
+  $('reveal-line').classList.add('hidden');
+  $('reveal-line').textContent = '';
+  $('recorded-line').textContent = '';
+  $('btn-reveal').classList.remove('hidden');
+  $('btn-next').textContent = '下一题 →';
+}
+
 async function loadQuestion(index) {
   const question = await api(
     `/api/question?session_id=${encodeURIComponent(state.sessionId)}&index=${index}`
@@ -381,6 +421,7 @@ async function loadQuestion(index) {
   state.index = index;
   state.question = question;
   showView('test');
+  resetAnswerArea();
   $('question-progress').textContent = `第 ${index + 1} / ${question.total} 题`;
   $('progress-bar').style.width = `${Math.round((index / question.total) * 100)}%`;
   setStatus('answer-status', '正在载入音频…');
@@ -394,17 +435,18 @@ async function loadQuestion(index) {
     setStatus('answer-status', `音频载入失败：${error.message}`, 'error');
     return;
   }
+  document.querySelectorAll('.answer').forEach((button) => { button.disabled = false; });
   state.questionShownAt = performance.now();
   updatePlayUI();
   prefetch(index + 1);
 }
 
+const CHOICE_LABELS = { a: 'A 更好', b: 'B 更好', tie: '听不出' };
+
 async function submitAnswer(choice) {
-  if (state.busy || !state.question || !state.sessionId) return;
-  state.busy = true;
-  stopPlayback(true);
+  if (state.busy || state.answered || !state.question || !state.sessionId) return;
   const reaction = Math.max(0, Math.round(performance.now() - state.questionShownAt));
-  setStatus('answer-status', '已记录，正在进入下一题…');
+  setStatus('answer-status', '正在记录…');
   try {
     const data = await api('/api/answer', {
       method: 'POST',
@@ -416,10 +458,55 @@ async function submitAnswer(choice) {
         reaction_ms: reaction,
       }),
     });
-    if (data.done) await showResult();
-    else await loadQuestion(state.index + 1);
+    stopPlayback(true);
+    state.answered = true;
+    state.lastAnswer = { choice, correctSide: data.correct_side, done: data.done };
+    renderConfirmation();
   } catch (error) {
     setStatus('answer-status', `提交失败：${error.message}`, 'error');
+  }
+}
+
+function renderConfirmation() {
+  const answer = state.lastAnswer;
+  document.querySelectorAll('.answer').forEach((button) => {
+    const chosen = button.dataset.choice === answer.choice;
+    button.classList.toggle('selected', chosen);
+    button.classList.toggle('dim', !chosen);
+  });
+  $('recorded-line').textContent = `已记录：${CHOICE_LABELS[answer.choice] || answer.choice}`;
+  $('btn-next').textContent = answer.done ? '查看结果 →' : '下一题 →';
+  $('btn-reveal').classList.remove('hidden');
+  $('reveal-line').classList.add('hidden');
+  $('reveal-line').textContent = '';
+  $('confirm-area').classList.remove('hidden');
+  setStatus('answer-status', '');
+}
+
+/* 可选：查看答案。默认不自动揭晓，避免对后续题产生反馈偏置。 */
+function revealAnswer() {
+  const answer = state.lastAnswer;
+  if (!answer) return;
+  $('btn-reveal').classList.add('hidden');
+  const text = answer.correctSide === null
+    ? '本题 A 与 B 都是无损（安慰剂题），正确答案是「听不出」。'
+    : `本题无损的是 ${answer.correctSide.toUpperCase()}，正确答案是「${CHOICE_LABELS[answer.correctSide]}」。`;
+  $('reveal-line').textContent = text;
+  $('reveal-line').classList.remove('hidden');
+}
+
+async function advance() {
+  if (!state.answered || state.busy || !state.lastAnswer) return;
+  state.busy = true;
+  const answer = state.lastAnswer;
+  state.answered = false;
+  state.lastAnswer = null;
+  $('confirm-area').classList.add('hidden');
+  try {
+    if (answer.done) await showResult();
+    else await loadQuestion(state.index + 1);
+  } catch (error) {
+    setStatus('answer-status', `无法进入下一题：${error.message}`, 'error');
   } finally {
     state.busy = false;
   }
@@ -479,22 +566,31 @@ function wireEvents() {
   });
   $('btn-start').addEventListener('click', startTest);
   $('btn-retest').addEventListener('click', startTest);
-  $('btn-back').addEventListener('click', () => {
+  $('btn-back').addEventListener('click', async () => {
     stopPlayback(true);
+    await endSession();
     showView('library');
     loadLibrary().catch(() => {});
   });
 
   $('btn-play-a').addEventListener('click', () => toggleSide('a'));
   $('btn-play-b').addEventListener('click', () => toggleSide('b'));
+  $('btn-reveal').addEventListener('click', revealAnswer);
+  $('btn-next').addEventListener('click', advance);
   document.querySelectorAll('.answer').forEach((button) => {
     button.addEventListener('click', () => submitAnswer(button.dataset.choice));
   });
+
+  window.addEventListener('pagehide', () => { endSession({ beacon: true }); });
 
   document.addEventListener('keydown', (event) => {
     if ($('view-test').classList.contains('hidden')) return;
     if (event.target && ['INPUT', 'TEXTAREA'].includes(event.target.tagName)) return;
     const key = event.key.toLowerCase();
+    if (state.answered) {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); advance(); }
+      return;
+    }
     if (key === '1') submitAnswer('a');
     else if (key === '2') submitAnswer('b');
     else if (key === '3') submitAnswer('tie');

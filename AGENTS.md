@@ -189,7 +189,7 @@ RESULT_BRACKETS = [("≤96 kbps"), ("128–192 kbps"), ("≥224 kbps")]
 ```
 GET    /api/library                       → { items, cache_bytes }
 POST   /api/library/upload        form-data: files   → { results: [{filename,status,audio_id,reason}] }
-DELETE /api/library/{audio_id}            → 200 { deleted, freed_bytes } / 404 / 409（被进行中的测试引用）
+DELETE /api/library/{audio_id}            → 200 { deleted, freed_bytes } / 404 / 409（被**尚未完成**的测试引用）
 DELETE /api/cache                         → 清空片段与刺激缓存 { freed_bytes }
 
 POST /api/start                   body: { audio_ids, mode } → { session_id, total, mode }
@@ -212,6 +212,10 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 其他约定：
 
 - `/api/answer` 的 `choice ∈ {a, b, tie}`，`reaction_ms` 从**题目渲染时刻**起算；同题重复提交幂等覆盖。
+  返回 `{ ok, index, next_index, done, correct_side }`：`correct_side ∈ {"a","b",null}`（`null` = 安慰剂题），
+  **仅作答后**才返回，而且整条链路始终不返回码率（验收 #8 成立）。
+- 删除库音频只在存在**尚未完成**（`len(answers) < len(questions)`）且引用它的会话时返回 409；
+  答完全部题目或 `/api/end` 之后即可删除。
 - 判定：真实题选中无损侧为正确，选 `tie` 记为"未听出"（不正确）；安慰剂题选 `tie` 才是正确。
 - 结果给逐档统计 + `≤96 / 128–192 / ≥224 kbps` 分档聚合 + Wilson 95% 区间；逐档只有单题时前端标注"样本不足"。
 - `/api/start` 会校验：`mode ∈ {short, detailed}`、`audio_ids` 去重后 1～3 个且都存在；参数不合法 400，音频不存在 404。
@@ -222,7 +226,13 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 
 **库管理**：列表、导入、删除、checkbox 选素材（1～3）、模式选择、开始测试。
 
-**测试**：题号/总数、进度条、A/B 播放按钮（循环、5 ms 淡入淡出）、三选项（A 更好 / B 更好 / 听不出）。不显示文件名、码率、编码器、时长。答后自动下一题。
+**测试**：题号/总数、进度条、A/B 播放按钮（循环、5 ms 淡入淡出）、三选项（A 更好 / B 更好 / 听不出）。不显示文件名、码率、编码器、时长。
+
+**作答后停留在本题**（不自动跳题）：高亮已选项、其余变暗，显示「已记录：X 更好」，并提供
+「查看答案」（**可选**手动揭晓，默认不自动揭晓以免对后续题产生反馈偏置）与「下一题 →」（末题为「查看结果 →」）。
+音频未载入完不允许作答，保证 `reaction_ms` 有效。
+键盘：`1/2/3` 作答、`A/B/空格` 切换试听、回车或空格进入下一题。
+离开测试页、点「再测一次」、或关闭标签页（`sendBeacon`）时都会调用 `/api/end`，不会留下"进行中"的引用。
 
 **结果**：码率 × 正确率表、安慰剂“听不出”比例、文字结论、再测一次 / 返回库。
 
@@ -243,9 +253,9 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 11. `/api/end` 后 session 目录被删。
 12. 改 `SEGMENT_ALGO_VERSION` 后 cache 失效重算。
 
-自动化覆盖对照（`make test`，46 项）：#1 见 README 的安装/运行两行命令；#3/#4/#5 由 `test_api.py`
-的导入与拒绝用例覆盖；#6/#10/#11 由清理用例覆盖（含硬链接 inode 断言）；#7 的实测值为 `ΔLUFS = 0.0000`
-（远严于 0.3，`test_prepare_pair_loudness_and_peak` 断言 ≤ 0.05）；#8 由
+自动化覆盖对照（`make test`，49 项）：#1 见 README 的安装/运行两行命令；#3/#4/#5 由 `test_api.py`
+的导入与拒绝用例覆盖；#6/#10/#11 由清理用例覆盖（含硬链接 inode 断言，以及"答完/结束后才能删除"的回归用例）；
+#7 的实测值为 `ΔLUFS = 0.0000`（远严于 0.3，`test_prepare_pair_loudness_and_peak` 断言 ≤ 0.05）；#8 由
 `test_question_does_not_leak_bitrate_or_codec` 覆盖（键集合白名单 + 禁用子串 + 两路 `Content-Length` 相等）；
 #9 由 `test_result_counts_correct_answers` / `test_result_flags_guessing` 用手算期望值覆盖；
 #12 由 `test_segment_algo_version_invalidates_cache` / `test_stimuli_algo_version_moves_cache_dir` 覆盖。
@@ -312,8 +322,9 @@ make test     # = TMPDIR=<项目>/data/tmp <tin_ear>/bin/python -m pytest -q
   `isolated_data` 夹具把 app 的全部数据目录重定向到本测试自己的临时目录；`fast_config` 把题量压到最小让 API 测试秒级完成。
 - `tests/test_pipeline.py`：常量守护、对齐符号与真实 MP3 往返、等响度/峰值、**增益必须是纯线性**（防限幅器）、
   切片逐采样精确、片段选择确定性与不重叠、缓存版本失效、WAV 头规范（48 kHz / 2ch / 720000 / FLOAT）。
-- `tests/test_api.py`：导入与去重、有损格式拒绝、删除与 409、题目参数校验、**防泄漏**、
-  安慰剂两路内容相同、作答幂等、结果统计与结论文案、启动清理、TTL 清理、路径穿越。
+- `tests/test_api.py`：导入与去重、有损格式拒绝、删除与 409（含"答完全部题目后即可删除"的回归）、
+  题目参数校验、**防泄漏**、`correct_side` 只在作答后返回且不含码率、安慰剂两路内容相同、作答幂等、
+  结果统计与结论文案、启动清理、TTL 清理、路径穿越。
 - 测试产物全部落在 `data/tmp/`（受 `TMPDIR` 约束），不写系统 temp 或用户目录。
 
 ## 15. 实测数据与实现记录（ffmpeg 6.1.1-3ubuntu5 / Python 3.12.15）

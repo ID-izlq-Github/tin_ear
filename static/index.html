@@ -58,7 +58,7 @@
         </button>
       </div>
 
-      <p class="hint center">点击 A / B 试听，切换时播放位置保持不变；再判断哪个更好</p>
+      <p class="hint center">点击 A / B 试听，切换时播放位置保持不变；作答后会停留在本题，可查看答案再进入下一题</p>
 
       <div class="answers">
         <button class="btn answer" data-choice="a">A 更好</button>
@@ -66,6 +66,15 @@
         <button class="btn answer" data-choice="tie">听不出</button>
       </div>
       <div id="answer-status" class="status"></div>
+
+      <div id="confirm-area" class="confirm hidden">
+        <div id="recorded-line" class="recorded"></div>
+        <div id="reveal-line" class="reveal hidden"></div>
+        <div class="row">
+          <button id="btn-reveal" class="btn">查看答案</button>
+          <button id="btn-next" class="btn primary">下一题 →</button>
+        </div>
+      </div>
     </div>
   </section>
 

@@ -221,6 +221,29 @@ def test_delete_is_refused_while_session_running(client, fast_config, long_sourc
     assert "进行中的测试" in response.json()["detail"]
 
 
+def test_delete_allowed_once_all_questions_are_answered(client, fast_config, long_source):
+    """回归：答完全部题目后不该再被当成"进行中的测试"而拒绝删除。"""
+    item = upload(client, long_source)
+    audio_id = item["audio_id"]
+    session_id = start_session(client, [audio_id])["session_id"]
+    for question in app_module.SESSIONS[session_id].questions:
+        assert _answer(client, session_id, question, _correct_choice(question)).status_code == 200
+
+    response = client.delete(f"/api/library/{audio_id}")
+    assert response.status_code == 200, response.text
+    assert not (app_module.LIBRARY_DIR / f"{audio_id}.flac").exists()
+    assert not (app_module.CACHE_DIR / audio_id).exists()
+
+
+def test_end_then_delete_works(client, fast_config, long_source):
+    """回归：结束测试后回到主页面应当可以删除音频。"""
+    item = upload(client, long_source)
+    audio_id = item["audio_id"]
+    session_id = start_session(client, [audio_id])["session_id"]
+    client.post("/api/end", json={"session_id": session_id})
+    assert client.delete(f"/api/library/{audio_id}").status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # 出题：参数校验 + 防泄漏
 # ---------------------------------------------------------------------------
@@ -429,6 +452,19 @@ def test_answer_done_flag(client, fast_config, long_source):
         assert payload["index"] == index
         assert payload["next_index"] == index + 1
         assert payload["done"] is (index == last)
+
+
+def test_answer_returns_correct_side_only_after_answering(client, fast_config, long_source):
+    """答案所在侧只在作答后返回；安慰剂题为 null；任何响应都不含码率。"""
+    item = upload(client, long_source)
+    session_id = start_session(client, [item["audio_id"]])["session_id"]
+    for question in app_module.SESSIONS[session_id].questions:
+        payload = _answer(client, session_id, question, "tie").json()
+        assert set(payload) == {"ok", "index", "next_index", "done", "correct_side"}, payload
+        if question.bitrate is None:
+            assert payload["correct_side"] is None
+        else:
+            assert payload["correct_side"] == ("a" if question.lossless_is_a else "b")
 
 
 # ---------------------------------------------------------------------------

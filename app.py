@@ -1111,9 +1111,11 @@ async def api_upload(files: list[UploadFile] = File(...)) -> dict:
 @app.delete("/api/library/{audio_id}")
 async def api_delete_library(audio_id: str) -> dict:
     item = _library_item(audio_id)
+    # 只有**尚未完成**的测试才算占用：答完全部题目后即不再阻止删除
     in_use = [
         session_id for session_id, state in SESSIONS.items()
-        if any(q.audio_id == audio_id for q in state.questions)
+        if len(state.answers) < len(state.questions)
+        and any(q.audio_id == audio_id for q in state.questions)
     ]
     if in_use:
         raise HTTPException(status_code=409, detail="该音频正被进行中的测试引用，请先结束测试")
@@ -1234,7 +1236,16 @@ async def api_answer(request: AnswerRequest) -> dict:
         raise HTTPException(status_code=400, detail="reaction_ms 不能为负")
     state.answers[question.question_id] = {"choice": request.choice, "reaction_ms": reaction}
     done = len(state.answers) >= len(state.questions)
-    return {"ok": True, "index": question.index, "next_index": question.index + 1, "done": done}
+    # 仅**作答之后**才返回答案所在侧；安慰剂题为 None。
+    # 注意：这里始终不返回码率，验收 #8「前端请求看不到码率」在整条链路上都成立。
+    correct_side = None if question.bitrate is None else ("a" if question.lossless_is_a else "b")
+    return {
+        "ok": True,
+        "index": question.index,
+        "next_index": question.index + 1,
+        "done": done,
+        "correct_side": correct_side,
+    }
 
 
 @app.get("/api/result")
