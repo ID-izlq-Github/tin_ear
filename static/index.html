@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TinEar · 本地音频盲测</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <h1>TinEar</h1>
+  <p class="sub">本地 MP3 码率盲测 · 听得出区别吗？</p>
+</header>
+
+<div id="banner" class="banner hidden"></div>
+
+<main>
+  <section id="view-library" class="view">
+    <div class="card">
+      <h2>音频库</h2>
+      <p class="hint">导入无损音频（FLAC / WAV / AIFF；采样率 ≥ 44.1 kHz，时长 ≥ 30 秒）。导入后统一转成 48 kHz 立体声 FLAC。</p>
+      <div class="row">
+        <label class="btn primary">导入音频
+          <input id="file-input" type="file" multiple hidden>
+        </label>
+        <button id="btn-refresh" class="btn">刷新</button>
+        <button id="btn-clear-cache" class="btn ghost">清理刺激缓存</button>
+      </div>
+      <div id="upload-status" class="status"></div>
+      <ul id="library-list" class="library"></ul>
+    </div>
+
+    <div class="card">
+      <h2>开始测试</h2>
+      <div class="row">
+        <label class="radio"><input type="radio" name="mode" value="short" checked> 快速（6 题）</label>
+        <label class="radio"><input type="radio" name="mode" value="detailed"> 详细（12 题）</label>
+      </div>
+      <p class="hint">选择 1～3 段素材，程序会自动截取 15 秒片段并生成不同码率的压缩版。已选 <b id="selected-count">0</b> 段。</p>
+      <button id="btn-start" class="btn primary big" disabled>开始盲测</button>
+      <div id="prepare-status" class="status"></div>
+    </div>
+  </section>
+
+  <section id="view-test" class="view hidden">
+    <div class="card test">
+      <div class="test-head">
+        <span id="question-progress">第 1 / 6 题</span>
+        <div class="progress"><div id="progress-bar"></div></div>
+      </div>
+
+      <div class="ab">
+        <button id="btn-play-a" class="btn ab-btn" data-side="a">
+          <span class="tag">A</span><span class="state">播放</span>
+        </button>
+        <button id="btn-play-b" class="btn ab-btn" data-side="b">
+          <span class="tag">B</span><span class="state">播放</span>
+        </button>
+      </div>
+
+      <p class="hint center">点击 A / B 试听，切换时播放位置保持不变；再判断哪个更好</p>
+
+      <div class="answers">
+        <button class="btn answer" data-choice="a">A 更好</button>
+        <button class="btn answer" data-choice="b">B 更好</button>
+        <button class="btn answer" data-choice="tie">听不出</button>
+      </div>
+      <div id="answer-status" class="status"></div>
+    </div>
+  </section>
+
+  <section id="view-result" class="view hidden">
+    <div class="card">
+      <h2>测试结果</h2>
+      <div id="conclusion" class="conclusion"></div>
+      <h3>按码率分档</h3>
+      <table id="bracket-table" class="table"></table>
+      <h3>逐档明细</h3>
+      <table id="bitrate-table" class="table"></table>
+      <div id="placebo-line" class="placebo"></div>
+      <div class="row">
+        <button id="btn-retest" class="btn primary">再测一次</button>
+        <button id="btn-back" class="btn">返回音频库</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
