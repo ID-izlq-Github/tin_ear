@@ -19,6 +19,8 @@
     <div class="card">
       <h2>音频库</h2>
       <p class="hint">导入无损音频（FLAC / WAV / AIFF；采样率 ≥ 44.1 kHz，时长 ≥ 30 秒）。导入后统一转成 48 kHz 立体声 FLAC。</p>
+      <p class="hint"><b>选曲建议</b>：优先用配器复杂、动态强烈的曲目（打击乐、多层次编曲、大动态段落）；
+        安静、单调或本身就很"糊"的段落，即使在 32 kbps 下也可能听不出差别。</p>
       <div class="row">
         <label class="btn primary">导入音频
           <input id="file-input" type="file" multiple hidden>
@@ -33,10 +35,11 @@
     <div class="card">
       <h2>开始测试</h2>
       <div class="row">
-        <label class="radio"><input type="radio" name="mode" value="short" checked> 快速（6 题）</label>
-        <label class="radio"><input type="radio" name="mode" value="detailed"> 详细（12 题）</label>
+        <label class="radio"><input type="radio" name="mode" value="short" checked> 快速（6 题 · 每档 1 题）</label>
+        <label class="radio"><input type="radio" name="mode" value="detailed"> 详细（22 题 · 每档 2 题）</label>
       </div>
-      <p class="hint">选择 1～3 段素材，程序会自动截取 15 秒片段并生成不同码率的压缩版。已选 <b id="selected-count">0</b> 段。</p>
+      <p class="hint">选择 1～3 段素材，程序会自动截取 15 秒片段并生成不同码率的压缩版。已选 <b id="selected-count">0</b> 段。
+        题目顺序每轮随机（安慰剂题也混在其中），所以"第几题"没有任何提示。</p>
       <button id="btn-start" class="btn primary big" disabled>开始盲测</button>
       <div id="prepare-status" class="status"></div>
     </div>
@@ -86,6 +89,7 @@
       <table id="bracket-table" class="table"></table>
       <h3>逐档明细</h3>
       <table id="bitrate-table" class="table"></table>
+      <div id="stats-note" class="hint"></div>
       <div id="placebo-line" class="placebo"></div>
       <div class="row">
         <button id="btn-retest" class="btn primary">再测一次</button>

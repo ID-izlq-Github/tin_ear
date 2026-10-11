@@ -89,8 +89,13 @@ function pct(value) {
 }
 
 function ciText(row) {
-  if (!row || !row.n) return '—';
+  if (!row || !row.n || row.n < 3) return '—';
   return `${Math.round(row.ci_low * 100)}%–${Math.round(row.ci_high * 100)}%`;
+}
+
+function pText(row) {
+  if (!row || row.p_value === null || row.p_value === undefined) return '—';
+  return row.p_value < 0.001 ? '<0.001' : row.p_value.toFixed(3);
 }
 
 function buildTable(table, headers, rows) {
@@ -376,7 +381,7 @@ async function startTest() {
   await endSession(); // 先收掉上一轮，避免留下"进行中"的引用
   const mode = document.querySelector('input[name="mode"]:checked').value;
   $('btn-start').disabled = true;
-  setStatus('prepare-status', '正在准备测试：截取片段、生成并校准压缩版（首次可能要十几秒）…');
+  setStatus('prepare-status', '正在准备刺激：已有的片段直接复用，缺的才生成并做响度/对齐校准…');
   try {
     const data = await api('/api/start', {
       method: 'POST',
@@ -387,7 +392,12 @@ async function startTest() {
     state.total = data.total;
     state.mode = data.mode;
     state.bufferCache.clear();
-    setStatus('prepare-status', '');
+    const stimuli = data.stimuli;
+    setStatus(
+      'prepare-status',
+      stimuli ? `刺激就绪：新生成 ${stimuli.generated} 个，复用 ${stimuli.reused} 个。` : '',
+      'ok'
+    );
     await loadQuestion(0);
   } catch (error) {
     setStatus('prepare-status', `准备失败：${error.message}`, 'error');
@@ -460,7 +470,12 @@ async function submitAnswer(choice) {
     });
     stopPlayback(true);
     state.answered = true;
-    state.lastAnswer = { choice, correctSide: data.correct_side, done: data.done };
+    state.lastAnswer = {
+      choice,
+      accepted: data.accepted !== false,
+      reveal: data.reveal || null,
+      done: data.done,
+    };
     renderConfirmation();
   } catch (error) {
     setStatus('answer-status', `提交失败：${error.message}`, 'error');
@@ -474,9 +489,14 @@ function renderConfirmation() {
     button.classList.toggle('selected', chosen);
     button.classList.toggle('dim', !chosen);
   });
-  $('recorded-line').textContent = `已记录：${CHOICE_LABELS[answer.choice] || answer.choice}`;
+  if (answer.accepted) {
+    $('recorded-line').textContent = `已记录：${CHOICE_LABELS[answer.choice] || answer.choice}`;
+    $('btn-reveal').classList.remove('hidden');
+  } else {
+    $('recorded-line').textContent = '本题已作答（首答即最终），本次修改已忽略。';
+    $('btn-reveal').classList.add('hidden');
+  }
   $('btn-next').textContent = answer.done ? '查看结果 →' : '下一题 →';
-  $('btn-reveal').classList.remove('hidden');
   $('reveal-line').classList.add('hidden');
   $('reveal-line').textContent = '';
   $('confirm-area').classList.remove('hidden');
@@ -487,10 +507,29 @@ function renderConfirmation() {
 function revealAnswer() {
   const answer = state.lastAnswer;
   if (!answer) return;
+  const reveal = answer.reveal;
   $('btn-reveal').classList.add('hidden');
-  const text = answer.correctSide === null
-    ? '本题 A 与 B 都是无损（安慰剂题），正确答案是「听不出」。'
-    : `本题无损的是 ${answer.correctSide.toUpperCase()}，正确答案是「${CHOICE_LABELS[answer.correctSide]}」。`;
+  if (!reveal) {
+    $('reveal-line').textContent = '本题已按首次作答计分，不再显示答案。';
+    $('reveal-line').classList.remove('hidden');
+    return;
+  }
+  const sideLabel = (side) => (reveal.sides[side].kind === 'lossless'
+    ? '无损'
+    : `MP3 ${reveal.sides[side].bitrate} kbps`);
+  let text;
+  if (reveal.placebo) {
+    const same = reveal.same_segment ? '同一片段的两份拷贝' : '两个片段，都是无损';
+    const verdict = answer.choice === 'tie' ? '✔ 你选了「听不出」' : '✘ 你在没有差异的两路之间"听出了"更好的一边';
+    text = `A：无损 / B：无损（${same}）—— 这是安慰剂题，正确答案是「听不出」。${verdict}`;
+  } else {
+    const correct = answer.choice === reveal.correct_side;
+    const verdict = correct
+      ? '✔ 你选对了'
+      : (answer.choice === 'tie' ? '✘ 这一题其实能听出来' : '✘ 你选错了');
+    text = `A：${sideLabel('a')} / B：${sideLabel('b')} —— 无损在 ${reveal.correct_side.toUpperCase()}`
+      + `（正确答案：${CHOICE_LABELS[reveal.correct_side]}）。${verdict}`;
+  }
   $('reveal-line').textContent = text;
   $('reveal-line').classList.remove('hidden');
 }
@@ -517,28 +556,49 @@ async function showResult() {
   const result = await api(`/api/result?session_id=${encodeURIComponent(state.sessionId)}`);
   $('conclusion').textContent = result.conclusion;
 
+  const bracketRows = [];
+  if (result.overall && result.overall.n) {
+    bracketRows.push(['全部真实题', result.overall.n, result.overall.correct,
+      pct(result.overall.accuracy), ciText(result.overall), pText(result.overall), result.overall.note]);
+  }
+  for (const row of result.by_bracket) {
+    bracketRows.push([row.label, row.n, row.correct, pct(row.accuracy), ciText(row), pText(row), row.note]);
+  }
   buildTable(
     $('bracket-table'),
-    ['码率区间', '题数', '答对', '正确率', '95% 置信区间'],
-    result.by_bracket.map((row) => [row.label, row.n, row.correct, pct(row.accuracy), ciText(row)])
+    ['码率区间', '题数', '答对', '正确率', '95% 置信区间', 'p 值', '判定'],
+    bracketRows
   );
   buildTable(
     $('bitrate-table'),
-    ['码率 (kbps)', '题数', '答对', '正确率', '95% 置信区间', '平均反应', '备注'],
+    ['码率 (kbps)', '题数', '答对', '正确率', '95% 置信区间', 'p 值', '平均反应', '判定'],
     result.by_bitrate.map((row) => [
       row.bitrate,
       row.n,
       row.correct,
       pct(row.accuracy),
       ciText(row),
+      pText(row),
       row.mean_reaction_ms ? `${(row.mean_reaction_ms / 1000).toFixed(1)} s` : '—',
-      row.n <= 1 ? '单题，样本不足' : '',
+      row.note,
     ])
   );
 
+  const chance = result.chance_level !== undefined
+    ? `${Math.round(result.chance_level * 100)}%`
+    : '33%';
+  const needed = result.power_required_n || 7;
+  $('stats-note').textContent = [
+    `统计口径：三选一（A / B / 听不出）的瞎猜基线是 ${chance}，不是 50%；`,
+    `p 值是单侧精确二项检验（H0：正确率 = 瞎猜基线），p < ${result.alpha || 0.05} 才判「显著高于瞎猜」。`,
+    `每档少于 3 题时任何结果都无法判定 —— 逐档表只作参考，结论看「全部真实题」与分档行。`,
+    `要让每档达到 80% 检验功效（假定真听出率 0.8），约需每档 ${needed} 题；`,
+    '想要更硬的结论，就把 app.py 顶部的 DETAILED_TEST_TOTAL / SHORT_TEST_TOTAL 调大（码率阶梯会自动循环）。',
+  ].join('\n');
+
   const placebo = result.placebo;
   $('placebo-line').textContent = placebo.n
-    ? `安慰剂题（A、B 均为无损）：共 ${placebo.n} 题，其中 ${placebo.tie} 题选了「听不出」（${pct(placebo.tie_rate)}）。若这一比例偏低，说明倾向于听到并不存在的差异。`
+    ? `安慰剂题（混在题目中，A、B 均为无损）：共 ${placebo.n} 题，其中 ${placebo.tie} 题选了「听不出」（${pct(placebo.tie_rate)}）。若这一比例偏低，说明倾向于听到并不存在的差异。`
     : '本次没有安慰剂题。';
 
   showView('result');

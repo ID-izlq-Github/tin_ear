@@ -38,6 +38,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from scipy import ndimage
 from scipy import signal as sps
+from scipy import stats as sps_stats
 
 # ---------------------------------------------------------------------------
 # 路径
@@ -72,8 +73,8 @@ TRUE_PEAK_SLACK_DB = 0.05  # 浮点容差
 
 SHORT_TEST_BITRATES = [48, 96, 160, 224, 320]
 DETAILED_TEST_BITRATES = [32, 48, 64, 80, 96, 128, 160, 192, 256, 320]
-SHORT_TEST_TOTAL = 6  # 5 真实 + 1 安慰剂
-DETAILED_TEST_TOTAL = 12  # 10 真实 + 2 安慰剂
+SHORT_TEST_TOTAL = 6  # 5 真实 + 1 安慰剂（快速模式：每档 1 题）
+DETAILED_TEST_TOTAL = 22  # 20 真实 + 2 安慰剂（详细模式：每档 2 题）
 SESSION_TTL_SECONDS = 7200
 
 # 新增
@@ -111,9 +112,16 @@ LAME_EXTRA_ARGS = [
     "-write_id3v1", "0",
     "-map_metadata", "-1",
 ]
-SHUFFLE_QUESTIONS = False  # 默认保留 AGENTS.md「码率从低到高」
+SHUFFLE_ALL_QUESTIONS = True  # 真实题与安慰剂题统一打乱位置，避免用「第几题」预判
 PLACEBO_SAME_SEGMENT = True  # 默认：安慰剂 = 同一片段的两份无损拷贝
 RESULT_BRACKETS = [(0, 96, "≤96 kbps"), (128, 192, "128–192 kbps"), (224, 10**9, "≥224 kbps")]
+
+# 统计口径（AGENTS.md §4.1）
+CHANCE_LEVEL = 1.0 / 3.0  # 三选一（A/B/听不出）的瞎猜基线，不是 1/2
+ALPHA = 0.05  # 单侧精确二项检验的显著性水平
+POWER_TARGET = 0.8  # 期望的检验功效（用于算"每档需要多少题"）
+P1_FOR_POWER = 0.8  # 计算功效时假定的真实听出率
+MIN_N_FOR_SIGNIFICANCE = 3  # 少于 3 题任何结果都无法判定（n=1 的最小 p 就是 1/3）
 
 
 class AudioToolError(RuntimeError):
@@ -458,9 +466,11 @@ async def _import_one(upload: UploadFile) -> dict:
 
         converted = TMP_DIR / f"conv_{secrets.token_hex(8)}.flac"
         try:
+            # -map 0:a:0：只取音频流。否则内嵌封面（attached_pic 视频流）会被一起拷进库内 FLAC，
+            # 后续切片段/编码 MP3 时 mp3 muxer 会尝试写 ID3v2 APIC 而我们的 ID3v2 是关闭的 → rc=234。
             await _ffmpeg(
                 [
-                    "-y", "-i", str(src), "-map_metadata", "-1",
+                    "-y", "-i", str(src), "-map", "0:a:0", "-map_metadata", "-1",
                     "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
                     "-c:a", "flac", "-compression_level", "5", str(converted),
                 ]
@@ -713,11 +723,15 @@ async def _cut_segment(flac: Path, out: Path, start: float) -> None:
     注意：-ss 必须放在 -i 之前（输入 seek）。本机 ffmpeg 6.1.1 上，把 -ss 放到 -i 之后
     的“输出 seek”在 start 较大时（实测 40 s）会输出整段数字静音，因此这里固定用输入 seek；
     ffmpeg 默认 -accurate_seek 会解码到精确采样点，采样级精度由测试守护。
+
+    -map 0:a:0 也是必需的：带内嵌封面的源在 start=0 时会把封面帧（attached_pic 视频流）
+    一起写进片段，进而让 MP3 编码步骤以 rc=234 失败（见 _import_one 的说明）。
     """
     fade_out_start = SEGMENT_SECONDS - SEGMENT_FADE_SECONDS
     await _ffmpeg(
         [
             "-y", "-ss", f"{start:.6f}", "-i", str(flac), "-t", str(SEGMENT_SECONDS),
+            "-map", "0:a:0",
             "-af",
             f"afade=t=in:st=0:d={SEGMENT_FADE_SECONDS},"
             f"afade=t=out:st={fade_out_start}:d={SEGMENT_FADE_SECONDS}",
@@ -744,7 +758,8 @@ def _stimuli_key(seg_index: int, bitrate: int | None, alt_seg: int | None = None
 
 async def _ensure_stimuli(
     audio_id: str, seg_index: int, bitrate: int | None, alt_seg: int | None = None
-) -> dict:
+) -> tuple[dict, bool]:
+    """返回 (刺激条目, 是否命中缓存)。命中缓存只是读 index.json，不重算。"""
     meta = await _ensure_segments(audio_id)
     seg_files = {seg["index"]: seg["file"] for seg in meta["segments"]}
     if seg_index not in seg_files:
@@ -757,7 +772,7 @@ async def _ensure_stimuli(
     key = _stimuli_key(seg_index, bitrate, alt_seg)
     entry = (index.get("entries") or {}).get(key)
     if entry and all((cache_root / rel).exists() for rel in entry["files"].values()):
-        return entry
+        return entry, True
 
     seg_path = CACHE_DIR / audio_id / seg_files[seg_index]
     master, _ = _fit_length(_read_audio(seg_path))
@@ -772,7 +787,7 @@ async def _ensure_stimuli(
         try:
             await _ffmpeg(
                 [
-                    "-y", "-i", str(seg_path), *LAME_EXTRA_ARGS,
+                    "-y", "-i", str(seg_path), "-map", "0:a:0", *LAME_EXTRA_ARGS,
                     "-c:a", "libmp3lame", "-b:a", f"{bitrate}k", "-f", "mp3", str(tmp_mp3),
                 ]
             )
@@ -805,7 +820,7 @@ async def _ensure_stimuli(
     }
     index.setdefault("entries", {})[key] = entry
     _write_json(index_path, index)
-    return entry
+    return entry, False
 
 
 # ---------------------------------------------------------------------------
@@ -906,17 +921,49 @@ def _build_questions(mode: str, audio_ids: list[str], segment_indices: dict[str,
             )
         )
 
-    if SHUFFLE_QUESTIONS:
+    if SHUFFLE_ALL_QUESTIONS:
+        # 真实题与安慰剂题一起打乱：这道题是第几题不再携带任何信息
+        # （既不能靠"最后一题必是安慰剂"直接按听不出，也不能靠阶梯顺序推码率）。
         rng.shuffle(questions)
-        for i, q in enumerate(questions):
-            q.index = i
+    for position, question in enumerate(questions):
+        question.index = position
+        question.question_id = f"q{position}"
     return questions
 
 
-async def _prepare_session(questions: list[Question]) -> None:
-    """为每道题准备刺激并把音频文件硬链接进 session 目录。"""
+async def _prepare_session(questions: list[Question]) -> dict:
+    """为每道题准备刺激（命中缓存则复用），返回本次新生成/复用的数量。"""
+    generated = 0
+    reused = 0
     for q in questions:
-        q.stimulus = await _ensure_stimuli(q.audio_id, q.seg_index, q.bitrate, q.alt_seg)
+        entry, from_cache = await _ensure_stimuli(q.audio_id, q.seg_index, q.bitrate, q.alt_seg)
+        q.stimulus = entry
+        if from_cache:
+            reused += 1
+        else:
+            generated += 1
+    return {"generated": generated, "reused": reused}
+
+
+def _reveal(question: Question) -> dict:
+    """本题两侧的真实身份（无损 / MP3 码率）。只在作答之后的响应里出现。"""
+    lossless = {"kind": "lossless", "bitrate": None}
+    coded = {"kind": "mp3", "bitrate": question.bitrate}
+    files = question.stimulus.get("files", {}) if question.stimulus else {}
+    if question.bitrate is None:
+        # 安慰剂题：两侧都是无损（默认还是同一片段的两份拷贝）
+        sides = {"a": dict(lossless), "b": dict(lossless)}
+    else:
+        sides = {
+            "a": dict(lossless if question.lossless_is_a else coded),
+            "b": dict(coded if question.lossless_is_a else lossless),
+        }
+    return {
+        "placebo": question.bitrate is None,
+        "correct_side": None if question.bitrate is None else ("a" if question.lossless_is_a else "b"),
+        "same_segment": bool(files.get("ll")) and files.get("ll") == files.get("mp3"),
+        "sides": sides,
+    }
 
 
 def _destroy_session(session_id: str) -> None:
@@ -959,6 +1006,70 @@ def _wilson_interval(successes: int, total: int, z: float = 1.96) -> tuple[float
     return max(0.0, center - half), min(1.0, center + half)
 
 
+def _binom_p_value(successes: int, total: int, p0: float = CHANCE_LEVEL) -> float | None:
+    """单侧精确二项检验 P(X >= successes | p = p0)，p0 默认 = 三选一瞎猜基线 1/3。"""
+    if total <= 0:
+        return None
+    return float(sps_stats.binomtest(successes, total, p0, alternative="greater").pvalue)
+
+
+def _required_n(
+    p0: float = CHANCE_LEVEL,
+    p1: float = P1_FOR_POWER,
+    alpha: float = ALPHA,
+    power: float = POWER_TARGET,
+) -> int:
+    """达到指定功效所需的题数（单侧精确二项检验）。找不到则返回 -1。"""
+    for n in range(1, 500):
+        critical = next(
+            (k for k in range(n + 1) if sps_stats.binom.sf(k - 1, n, p0) <= alpha), None
+        )
+        if critical is None:
+            continue
+        if sps_stats.binom.sf(critical - 1, n, p1) >= power:
+            return n
+    return -1
+
+
+# 当前口径下"每档要看多少题"才能在 80% 功效下做出判断（默认：7 题）
+POWER_REQUIRED_N = _required_n()
+
+
+def _row_stats(correct: int, total: int) -> dict:
+    """一行统计：计数 + 描述性 Wilson 区间 + 单侧精确二项检验（H0 = 1/3）。"""
+    if total <= 0:
+        return {
+            "n": 0,
+            "correct": 0,
+            "accuracy": None,
+            "ci_low": 0.0,
+            "ci_high": 0.0,
+            "p_value": None,
+            "significant": False,
+            "note": "没有作答",
+        }
+    low, high = _wilson_interval(correct, total)
+    p_value = _binom_p_value(correct, total)
+    significant = total >= MIN_N_FOR_SIGNIFICANCE and p_value is not None and p_value < ALPHA
+    if total < MIN_N_FOR_SIGNIFICANCE:
+        note = f"样本不足（n<{MIN_N_FOR_SIGNIFICANCE}，无法判定）"
+    elif significant:
+        note = "显著高于瞎猜基线"
+    else:
+        note = "与瞎猜基线无显著差异"
+    return {
+        "n": total,
+        "correct": correct,
+        "accuracy": round(correct / total, 4),
+        "ci_low": round(low, 4),
+        "ci_high": round(high, 4),
+        # 不四舍五入：20/20 的精确 p 是 2.9e-10，舍入到 4 位会变成误导性的 0.0
+        "p_value": p_value,
+        "significant": significant,
+        "note": note,
+    }
+
+
 def _is_correct(question: Question, choice: str) -> bool | None:
     if choice == "tie":
         return question.bitrate is None
@@ -973,23 +1084,15 @@ def _build_result(state: SessionState) -> dict:
     real = [q for q in answered if q.bitrate is not None]
     placebo = [q for q in answered if q.bitrate is None]
 
-    def table(items: list[Question]) -> dict:
-        correct = sum(1 for q in items if _is_correct(q, state.answers[q.question_id]["choice"]))
-        low, high = _wilson_interval(correct, len(items))
-        return {
-            "n": len(items),
-            "correct": correct,
-            "accuracy": round(correct / len(items), 4) if items else None,
-            "ci_low": round(low, 4),
-            "ci_high": round(high, 4),
-        }
+    def correct_of(items: list[Question]) -> int:
+        return sum(1 for q in items if _is_correct(q, state.answers[q.question_id]["choice"]))
 
     by_bitrate = []
     for bitrate in (SHORT_TEST_BITRATES if state.mode == "short" else DETAILED_TEST_BITRATES):
         items = [q for q in real if q.bitrate == bitrate]
         if not items:
             continue
-        row = {"bitrate": bitrate, **table(items)}
+        row = {"bitrate": bitrate, **_row_stats(correct_of(items), len(items))}
         times = [state.answers[q.question_id]["reaction_ms"] for q in items
                  if state.answers[q.question_id].get("reaction_ms") is not None]
         row["mean_reaction_ms"] = round(sum(times) / len(times)) if times else None
@@ -1000,7 +1103,7 @@ def _build_result(state: SessionState) -> dict:
         items = [q for q in real if low <= q.bitrate <= high]
         if not items:
             continue
-        by_bracket.append({"label": label, "range": [low, high], **table(items)})
+        by_bracket.append({"label": label, "range": [low, high], **_row_stats(correct_of(items), len(items))})
 
     placebo_ties = sum(1 for q in placebo if state.answers[q.question_id]["choice"] == "tie")
     placebo_row = {
@@ -1009,36 +1112,64 @@ def _build_result(state: SessionState) -> dict:
         "tie_rate": round(placebo_ties / len(placebo), 4) if placebo else None,
     }
 
+    overall = _row_stats(correct_of(real), len(real))
     return {
         "mode": state.mode,
         "total": len(state.questions),
         "answered": len(answered),
         "real_total": len([q for q in state.questions if q.bitrate is not None]),
         "real_answered": len(real),
-        "real_correct": sum(1 for q in real if _is_correct(q, state.answers[q.question_id]["choice"])),
+        "real_correct": overall["correct"],
         "placebo_total": len([q for q in state.questions if q.bitrate is None]),
+        "overall": overall,
         "by_bitrate": by_bitrate,
         "by_bracket": by_bracket,
         "placebo": placebo_row,
-        "conclusion": _conclusion(by_bracket, placebo_row),
+        "chance_level": round(CHANCE_LEVEL, 4),
+        "alpha": ALPHA,
+        "power_required_n": POWER_REQUIRED_N,
+        "conclusion": _conclusion(overall, by_bracket, by_bitrate, placebo_row),
     }
 
 
-def _conclusion(by_bracket: list[dict], placebo: dict) -> str:
-    if not by_bracket and not placebo["n"]:
+def _p_text(p_value: float | None) -> str:
+    if p_value is None:
+        return "p 值缺失"
+    return "p<0.001" if p_value < 0.001 else f"p={p_value:.3f}"
+
+
+def _verdict(row: dict) -> str:
+    if row["n"] < MIN_N_FOR_SIGNIFICANCE:
+        return f"样本不足（n={row['n']} < {MIN_N_FOR_SIGNIFICANCE}），无法判定"
+    if row["significant"]:
+        return f"显著高于瞎猜基线 1/3（{_p_text(row['p_value'])}）"
+    return f"与瞎猜基线无显著差异（{_p_text(row['p_value'])}）"
+
+
+def _conclusion(overall: dict, by_bracket: list[dict], by_bitrate: list[dict], placebo: dict) -> str:
+    if not overall["n"] and not placebo["n"]:
         return "还没有作答，无法给出结论。"
-    significant = [b["label"] for b in by_bracket if b["n"] > 0 and b["ci_low"] > 0.5]
-    not_significant = [b["label"] for b in by_bracket if b["n"] > 0 and b["ci_low"] <= 0.5]
-    parts: list[str] = []
-    if significant:
-        parts.append("；".join(f"{label} 能可靠听出差异" for label in significant))
-    if not_significant:
-        parts.append("；".join(f"{label} 与瞎猜无显著差异" for label in not_significant))
-    if not parts:
-        parts.append("样本不足，无法判断")
+    sentences: list[str] = []
+    if overall["n"]:
+        sentences.append(
+            f"真实题总体 {overall['correct']}/{overall['n']}"
+            f"（{round(overall['accuracy'] * 100)}%）：{_verdict(overall)}"
+        )
+    for bracket in by_bracket:
+        sentences.append(
+            f"{bracket['label']} {bracket['correct']}/{bracket['n']}：{_verdict(bracket)}"
+        )
+    if not sentences:
+        sentences.append("没有真实题作答，无法判断")
+    if by_bitrate:
+        max_n = max(row["n"] for row in by_bitrate)
+        sentences.append(
+            f"要让每档都达到 {round(POWER_TARGET * 100)}% 检验功效"
+            f"（假定真听出率 {P1_FOR_POWER}），约需每档 {POWER_REQUIRED_N} 题，本次每档最多 {max_n} 题"
+        )
     if placebo["n"] and placebo["tie_rate"] is not None and placebo["tie_rate"] < 0.5:
-        parts.append("安慰剂题上你多次声称听出差异，提示存在瞎猜倾向")
-    return "。".join(parts) + "。"
+        sentences.append("安慰剂题上你多次声称听出差异，提示存在瞎猜倾向")
+    return "；".join(sentences) + "。"
 
 
 # ---------------------------------------------------------------------------
@@ -1147,7 +1278,7 @@ async def api_start(request: StartRequest) -> dict:
 
     questions = _build_questions(request.mode, audio_ids, segment_indices)
     try:
-        await _prepare_session(questions)
+        stimuli = await _prepare_session(questions)
     except AudioToolError as exc:
         raise HTTPException(status_code=500, detail=f"生成刺激失败：{exc}") from exc
 
@@ -1177,7 +1308,7 @@ async def api_start(request: StartRequest) -> dict:
             role_tokens[role] = token
         state.tokens[question.question_id] = role_tokens
     SESSIONS[session_id] = state
-    return state.to_public()
+    return {**state.to_public(), "stimuli": stimuli}
 
 
 @app.get("/api/question")
@@ -1234,17 +1365,24 @@ async def api_answer(request: AnswerRequest) -> dict:
     reaction = request.reaction_ms
     if reaction is not None and reaction < 0:
         raise HTTPException(status_code=400, detail="reaction_ms 不能为负")
-    state.answers[question.question_id] = {"choice": request.choice, "reaction_ms": reaction}
+
+    stored = state.answers.get(question.question_id)
+    if stored is None:
+        state.answers[question.question_id] = {"choice": request.choice, "reaction_ms": reaction}
+        accepted = True
+    else:
+        # 首答即最终：同样的选项重复提交按幂等回放处理；改了选项则忽略（否则可以先看答案再改分）。
+        accepted = stored["choice"] == request.choice
     done = len(state.answers) >= len(state.questions)
-    # 仅**作答之后**才返回答案所在侧；安慰剂题为 None。
-    # 注意：这里始终不返回码率，验收 #8「前端请求看不到码率」在整条链路上都成立。
-    correct_side = None if question.bitrate is None else ("a" if question.lossless_is_a else "b")
+    # reveal（本题两侧各是无损还是 MP3 几 kbps）只在**首答/幂等重放**时返回，
+    # 未作答的题目（/api/question）与音频接口始终不泄漏任何码率信息。
     return {
         "ok": True,
         "index": question.index,
         "next_index": question.index + 1,
         "done": done,
-        "correct_side": correct_side,
+        "accepted": accepted,
+        "reveal": _reveal(question) if accepted else None,
     }
 
 

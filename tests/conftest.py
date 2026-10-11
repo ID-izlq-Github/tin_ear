@@ -87,6 +87,32 @@ def decode_f32(path: Path, channels: int = 2, sr: int = SR) -> np.ndarray:
     return np.frombuffer(raw[:usable], dtype="<f4").reshape(-1, channels).copy()
 
 
+def stream_types(path: Path) -> list[str]:
+    """文件里所有流的 codec_type（音频 / 视频 / 附件），用来看封面流有没有被带进来。"""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)],
+        check=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    ).stdout.decode()
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def attach_cover_flac(src: Path, dst: Path) -> Path:
+    """把 src 转成带内嵌封面（attached_pic 视频流）的 FLAC，复现真实音乐文件的样子。"""
+    cover = dst.with_suffix(".png")
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y",
+         "-f", "lavfi", "-i", "color=c=red:s=64x64:d=1", "-frames:v", "1", str(cover)],
+        check=True, stdin=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", str(src), "-i", str(cover),
+         "-map", "0:a", "-map", "1:v", "-c:a", "flac", "-c:v:0", "png",
+         "-disposition:v:0", "attached_pic", str(dst)],
+        check=True, stdin=subprocess.DEVNULL,
+    )
+    return dst
+
+
 # ---------------------------------------------------------------------------
 # fixtures
 # ---------------------------------------------------------------------------
@@ -119,6 +145,14 @@ def segment_pair(synth_dir: Path) -> tuple[np.ndarray, np.ndarray, Path]:
     encode_mp3(flac, mp3, 128)
     candidate = decode_f32(mp3)
     return master, candidate, flac
+
+
+@pytest.fixture(scope="session")
+def art_source(synth_dir: Path) -> Path:
+    """35 秒、带内嵌封面的 FLAC —— 复现"生成刺激失败 rc=234"的那类真实文件。"""
+    base = synth_dir / "art_base.flac"
+    sf.write(str(base), synth_signal(35.0, seed=5), SR, subtype="PCM_16", format="FLAC")
+    return attach_cover_flac(base, synth_dir / "art_cover.flac")
 
 
 @pytest.fixture(autouse=True)

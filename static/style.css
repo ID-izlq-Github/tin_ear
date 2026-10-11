@@ -41,6 +41,7 @@ main { max-width: 760px; margin: 0 auto; padding: 12px 16px 48px; }
 
 .hint { color: var(--muted); font-size: 14px; margin: 8px 0; }
 .hint.center { text-align: center; }
+#stats-note { white-space: pre-line; margin-top: 14px; }
 .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 12px; }
 
 .btn {

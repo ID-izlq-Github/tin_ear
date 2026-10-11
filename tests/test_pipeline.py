@@ -7,14 +7,18 @@ import json
 import subprocess
 
 import numpy as np
+import pytest
 import soundfile as sf
 
 import app as app_module
 from conftest import (
+    SR,
+    attach_cover_flac,
     cache_wavs,
     decode_f32,
     encode_mp3,
     start_session,
+    stream_types,
     synth_signal,
     upload,
     write_source,
@@ -35,14 +39,21 @@ def test_spec_constants_match_agents_md():
     assert app_module.SHORT_TEST_BITRATES == [48, 96, 160, 224, 320]
     assert app_module.DETAILED_TEST_BITRATES == [32, 48, 64, 80, 96, 128, 160, 192, 256, 320]
     assert app_module.SHORT_TEST_TOTAL == 6
-    assert app_module.DETAILED_TEST_TOTAL == 12
+    assert app_module.DETAILED_TEST_TOTAL == 22  # 每档 2 题，给统计一点功效
     assert app_module.SESSION_TTL_SECONDS == 7200
+    assert app_module.SHUFFLE_ALL_QUESTIONS is True  # 真实题与安慰剂题一起打乱
+    # 三选一的瞎猜基线是 1/3，不是 1/2
+    assert app_module.CHANCE_LEVEL == pytest.approx(1 / 3)
+    assert app_module.MIN_N_FOR_SIGNIFICANCE == 3
     # short 的档位并非 detailed 的子集（224 kbps 只在 short 里），两条阶梯的并集共 11 档
     union = set(app_module.SHORT_TEST_BITRATES) | set(app_module.DETAILED_TEST_BITRATES)
     assert union == {32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 320}
     assert 224 in app_module.SHORT_TEST_BITRATES and 224 not in app_module.DETAILED_TEST_BITRATES
     assert app_module._real_and_placebo_counts("short") == (5, 1)
-    assert app_module._real_and_placebo_counts("detailed") == (10, 2)
+    assert app_module._real_and_placebo_counts("detailed") == (20, 2)
+    # 默认题量下每档题数：快速 1 题、详细 2 题
+    assert app_module._real_and_placebo_counts("short")[0] / len(app_module.SHORT_TEST_BITRATES) == 1
+    assert app_module._real_and_placebo_counts("detailed")[0] / len(app_module.DETAILED_TEST_BITRATES) == 2
 
 
 def test_segment_geometry_is_mp3_frame_aligned():
@@ -219,6 +230,34 @@ def test_cut_segment_is_sample_accurate(isolated_data, tmp_path):
     assert float(np.max(np.abs(cut[middle] - reference[middle]))) < 1e-6
 
 
+def test_cut_segment_drops_attached_picture(isolated_data, tmp_path):
+    """带内嵌封面的源在 start=0 时也必须只切出音频流。
+
+    回归：封面（attached_pic 视频流）一旦混进片段，MP3 编码就会以
+    rc=234「Attached pictures were requested, but the ID3v2 header is disabled」失败。
+    起点必须正好是 0——起点大于 0 时 ffmpeg 本来就会漏掉封面帧，那样测不出这个 bug。
+    """
+    base = tmp_path / "base.flac"
+    sf.write(str(base), synth_signal(35.0, seed=11), SR, subtype="PCM_16", format="FLAC")
+    flac = attach_cover_flac(base, tmp_path / "withart.flac")
+    assert stream_types(flac) == ["audio", "video"], "前置条件：源文件应当带封面流"
+
+    out = tmp_path / "seg.flac"
+    asyncio.run(app_module._cut_segment(flac, out, 0.0))
+
+    assert stream_types(out) == ["audio"], "片段里不允许残留封面流"
+    assert sf.info(str(out)).frames == app_module.SEGMENT_SAMPLES
+
+
+def test_import_strips_attached_picture(client, art_source):
+    """导入时只映射音频流：库内母版不应再带封面（否则等于给下游埋雷）。"""
+    item = upload(client, art_source)
+    master = app_module.LIBRARY_DIR / f"{item['audio_id']}.flac"
+    assert stream_types(master) == ["audio"]
+    entry = next(e for e in app_module._library()["items"] if e["audio_id"] == item["audio_id"])
+    assert entry["source_codec"] == "flac"
+
+
 # ---------------------------------------------------------------------------
 # 刺激缓存
 # ---------------------------------------------------------------------------
@@ -232,10 +271,12 @@ def test_stimuli_cached_and_reusable(client, fast_config, long_source):
     assert files, "应生成刺激缓存"
     mtimes = {path.name: path.stat().st_mtime_ns for path in files}
 
-    start_session(client, [audio_id])
+    second = start_session(client, [audio_id])
     assert {path.name: path.stat().st_mtime_ns for path in cache_wavs(audio_id)} == mtimes, (
         "命中缓存不应重写文件"
     )
+    assert second["stimuli"]["generated"] == 0, "第二轮不应重新生成任何刺激"
+    assert second["stimuli"]["reused"] == second["total"]
 
     index = json.loads((app_module._stimuli_dir(audio_id) / "index.json").read_text("utf-8"))
     assert index["stimuli_algo_version"] == app_module.STIMULI_ALGO_VERSION
@@ -269,3 +310,83 @@ def test_stimulus_wav_headers_are_canonical(client, fast_config, long_source):
         assert info.frames == app_module.SEGMENT_SAMPLES
         assert info.subtype == "FLOAT"
         assert info.format == "WAV"
+
+
+# ---------------------------------------------------------------------------
+# 出题（乱序 / 覆盖面）
+# ---------------------------------------------------------------------------
+
+
+def _questions(spy_seed: int) -> list:
+    """用固定随机种子调 _build_questions，结果可复现。"""
+    import secrets as secrets_module
+
+    original = secrets_module.randbits
+    secrets_module.randbits = lambda _bits: spy_seed
+    try:
+        return app_module._build_questions("detailed", ["audio1"], {"audio1": [0, 1]})
+    finally:
+        secrets_module.randbits = original
+
+
+def test_questions_shuffle_but_keep_identical_stimulus_set(fast_config):
+    """安慰剂与真实题一起打乱：顺序变、用到的 (片段, 码率) 集合不变。"""
+    combos = set()
+    orders = set()
+    placebo_positions = set()
+    for seed in range(12):
+        questions = _questions(seed)
+        combos.add(tuple(sorted((str(q.bitrate), q.seg_index) for q in questions)))
+        orders.add(tuple(q.bitrate for q in questions))
+        placebo_positions.add(tuple(i for i, q in enumerate(questions) if q.bitrate is None))
+        assert [q.index for q in questions] == list(range(len(questions)))
+        assert [q.question_id for q in questions] == [f"q{i}" for i in range(len(questions))]
+    assert len(combos) == 1, "每轮用到的刺激集合必须完全一致，否则缓存复用会退化"
+    assert len(orders) > 1, "顺序应当被打乱"
+    assert len(placebo_positions) > 1, "安慰剂题的位置也应当被打乱（否则可以被预判）"
+
+
+def test_questions_cover_each_bitrate_evenly(fast_config, monkeypatch):
+    monkeypatch.setattr(app_module, "DETAILED_TEST_BITRATES", [32, 64, 128])
+    monkeypatch.setattr(app_module, "DETAILED_TEST_TOTAL", 8)  # 6 真实 + 2 安慰剂 → 每档 2 题
+    questions = app_module._build_questions("detailed", ["audio1"], {"audio1": [0, 1]})
+    assert len(questions) == 8
+    assert sum(1 for q in questions if q.bitrate is None) == 2
+    for bitrate in (32, 64, 128):
+        assert sum(1 for q in questions if q.bitrate == bitrate) == 2
+
+
+# ---------------------------------------------------------------------------
+# 统计口径（H0 = 三选一瞎猜基线 1/3）
+# ---------------------------------------------------------------------------
+
+
+def test_binom_p_value_and_required_n():
+    """逐档 n=1 是结构性无法判定；每档 7 题才能在 80% 功效下做出判断。"""
+    assert app_module._binom_p_value(0, 0) is None
+    assert app_module._binom_p_value(1, 1) == pytest.approx(1 / 3)  # n=1 永远不可能显著
+    assert app_module._binom_p_value(2, 2) == pytest.approx(1 / 9)
+    assert app_module._binom_p_value(3, 3) == pytest.approx(1 / 27)
+    assert app_module._binom_p_value(4, 5) == pytest.approx(0.0453, abs=1e-4)
+    assert app_module._binom_p_value(7, 10) == pytest.approx(0.0197, abs=1e-4)
+    assert app_module.POWER_REQUIRED_N == 7
+    assert app_module._required_n(p1=0.5) == 58  # 越接近基线越难判
+
+
+def test_row_stats_marks_small_samples_as_undecidable():
+    tiny = app_module._row_stats(1, 1)
+    assert tiny["p_value"] == pytest.approx(1 / 3, abs=1e-4)
+    assert tiny["significant"] is False
+    assert "样本不足" in tiny["note"]
+
+    clear = app_module._row_stats(5, 5)
+    assert clear["significant"] is True
+    assert "显著高于瞎猜基线" in clear["note"]
+
+    noise = app_module._row_stats(1, 4)
+    assert noise["significant"] is False
+    assert "无显著差异" in noise["note"]
+
+    empty = app_module._row_stats(0, 0)
+    assert empty["p_value"] is None and empty["accuracy"] is None
+    assert empty["significant"] is False

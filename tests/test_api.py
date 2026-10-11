@@ -13,6 +13,7 @@ import app as app_module
 from conftest import (
     cache_wavs,
     start_session,
+    stream_types,
     upload,
     write_source,
 )
@@ -309,6 +310,35 @@ def test_question_index_out_of_range_and_unknown_session(client, fast_config, lo
     ).status_code == 404
 
 
+def test_start_with_cover_art_source_builds_stimuli(client, fast_config, art_source, monkeypatch):
+    """端到端回归（rc=234）：带内嵌封面的源 + 起点为 0 的片段，以前 /api/start 会 500。
+
+    这里把片段选择固定到 0 秒：起点 > 0 时 ffmpeg 本来就会漏掉封面帧，测不出这个 bug。
+    """
+
+    def fake_analysis(mono):
+        return {
+            "selected": [{"index": 0, "start": 0.0, "end": 15.0, "score": 1.0}],
+            "analysis": {
+                "analysis_sr": app_module.ANALYSIS_SR,
+                "samples": int(mono.size),
+                "duration": float(mono.size / app_module.ANALYSIS_SR),
+                "silence_threshold_db": -60.0,
+                "weights": dict(app_module.SEG_WEIGHTS),
+                "window_count": 1,
+            },
+            "windows": [],
+        }
+
+    monkeypatch.setattr(app_module, "_analyse_windows", fake_analysis)
+    item = upload(client, art_source)
+    start_session(client, [item["audio_id"]])  # 修复前这里会以 500 + rc=234 失败
+
+    segment = app_module.CACHE_DIR / item["audio_id"] / "seg_0.flac"
+    assert stream_types(segment) == ["audio"]
+    assert cache_wavs(item["audio_id"]), "刺激应当已生成"
+
+
 def test_placebo_question_serves_identical_audio(client, fast_config, long_source):
     item = upload(client, long_source)
     session_id = start_session(client, [item["audio_id"]])["session_id"]
@@ -377,14 +407,15 @@ def test_answer_validation_and_idempotency(client, fast_config, long_source):
     ).status_code == 400
 
     assert _answer(client, session_id, question, "a").status_code == 200
-    assert _answer(client, session_id, question, "tie").status_code == 200  # 幂等覆盖
+    assert _answer(client, session_id, question, "a").status_code == 200  # 同选项幂等重放
+    assert _answer(client, session_id, question, "tie").status_code == 200  # 首答即最终：忽略修改
     answers = app_module.SESSIONS[session_id].answers
-    assert answers[question.question_id]["choice"] == "tie"
+    assert answers[question.question_id]["choice"] == "a"
     assert len(answers) == 1
 
 
 def test_result_counts_correct_answers(client, monkeypatch, long_source):
-    """5 道 96 kbps 全答对 → 该档显著听出；安慰剂全答「听不出」。"""
+    """5 道 96 kbps 全答对 → 该档显著高于瞎猜基线；安慰剂全答「听不出」。"""
     monkeypatch.setattr(app_module, "SHORT_TEST_BITRATES", [96])
     monkeypatch.setattr(app_module, "SHORT_TEST_TOTAL", 6)  # 5 真实 + 1 安慰剂
     item = upload(client, long_source)
@@ -399,18 +430,27 @@ def test_result_counts_correct_answers(client, monkeypatch, long_source):
     assert result["total"] == 6
     assert result["real_total"] == 5 and result["real_correct"] == 5
     assert result["placebo_total"] == 1
-    assert result["by_bitrate"] == [
-        {
-            "bitrate": 96, "n": 5, "correct": 5, "accuracy": 1.0,
-            "ci_low": pytest.approx(0.5655, abs=1e-3), "ci_high": 1.0,
-            "mean_reaction_ms": 1200,
-        }
-    ]
+    expected = {
+        "n": 5,
+        "correct": 5,
+        "accuracy": 1.0,
+        "ci_low": pytest.approx(0.5655, abs=1e-3),
+        "ci_high": 1.0,
+        "p_value": pytest.approx(0.0041, abs=1e-4),
+        "significant": True,
+        "note": "显著高于瞎猜基线",
+    }
+    assert result["by_bitrate"] == [{"bitrate": 96, **expected, "mean_reaction_ms": 1200}]
+    assert {k: v for k, v in result["by_bracket"][0].items() if k not in ("label", "range")} == expected
     assert result["by_bracket"][0]["label"] == "≤96 kbps"
-    assert result["by_bracket"][0]["n"] == 5
+    assert result["overall"] == expected
+    assert result["chance_level"] == pytest.approx(1 / 3, abs=1e-4)
+    assert result["alpha"] == 0.05
+    assert result["power_required_n"] == 7
     assert result["placebo"] == {"n": 1, "tie": 1, "tie_rate": 1.0}
-    assert "能可靠听出差异" in result["conclusion"]
-    assert "瞎猜" not in result["conclusion"]
+    assert "显著高于瞎猜基线" in result["conclusion"]
+    assert "瞎猜倾向" not in result["conclusion"]
+    assert "每档 7 题" in result["conclusion"]
 
 
 def test_result_flags_guessing(client, monkeypatch, long_source):
@@ -426,9 +466,33 @@ def test_result_flags_guessing(client, monkeypatch, long_source):
 
     result = client.get("/api/result", params={"session_id": session_id}).json()
     assert result["real_correct"] == 0
+    assert result["overall"]["significant"] is False
     assert result["placebo"]["tie_rate"] == 0.0
-    assert "与瞎猜无显著差异" in result["conclusion"]
+    assert "与瞎猜基线无显著差异" in result["conclusion"]
     assert "瞎猜倾向" in result["conclusion"]
+
+
+def test_result_statistics_payload(client, monkeypatch, long_source):
+    """未作答与单题两种情况下的统计字段：p 值缺失/样本不足都要如实反映。"""
+    monkeypatch.setattr(app_module, "SHORT_TEST_BITRATES", [96])
+    monkeypatch.setattr(app_module, "SHORT_TEST_TOTAL", 6)
+    item = upload(client, long_source)
+    session_id = start_session(client, [item["audio_id"]])["session_id"]
+
+    empty = client.get("/api/result", params={"session_id": session_id}).json()
+    assert empty["overall"]["n"] == 0 and empty["overall"]["p_value"] is None
+    assert empty["by_bitrate"] == [] and empty["placebo"]["n"] == 0
+    assert empty["conclusion"]
+
+    # 只答一道（真实题）→ 逐档 n=1，任何结果都不可能显著（p = 1/3）
+    real = next(q for q in app_module.SESSIONS[session_id].questions if q.bitrate is not None)
+    assert _answer(client, session_id, real, _correct_choice(real)).status_code == 200
+    one = client.get("/api/result", params={"session_id": session_id}).json()
+    assert one["by_bitrate"][0]["n"] == 1
+    assert one["by_bitrate"][0]["p_value"] == pytest.approx(1 / 3, abs=1e-4)
+    assert one["by_bitrate"][0]["significant"] is False
+    assert "样本不足" in one["by_bitrate"][0]["note"]
+    assert "样本不足" in one["conclusion"]
 
 
 def test_result_handles_unanswered_questions(client, fast_config, long_source):
@@ -454,17 +518,61 @@ def test_answer_done_flag(client, fast_config, long_source):
         assert payload["done"] is (index == last)
 
 
-def test_answer_returns_correct_side_only_after_answering(client, fast_config, long_source):
-    """答案所在侧只在作答后返回；安慰剂题为 null；任何响应都不含码率。"""
+def test_answer_reveals_both_sides_only_after_answering(client, fast_config, long_source):
+    """作答后才揭晓本题两侧身份（无损 / MP3 码率）；未作答的任何响应都不含码率。"""
     item = upload(client, long_source)
     session_id = start_session(client, [item["audio_id"]])["session_id"]
-    for question in app_module.SESSIONS[session_id].questions:
+    questions = app_module.SESSIONS[session_id].questions
+    assert any(q.bitrate is not None for q in questions)
+    assert any(q.bitrate is None for q in questions)
+
+    for index, question in enumerate(questions):
+        # 作答前：题目接口只有 5 个键，且不含任何码率/编码器字样
+        before = client.get("/api/question", params={"session_id": session_id, "index": index})
+        assert set(before.json()) == {"index", "total", "question_id", "url_a", "url_b"}
+        for needle in FORBIDDEN_SUBSTRINGS:
+            assert needle not in before.text.lower()
+
         payload = _answer(client, session_id, question, "tie").json()
-        assert set(payload) == {"ok", "index", "next_index", "done", "correct_side"}, payload
+        assert set(payload) == {"ok", "index", "next_index", "done", "accepted", "reveal"}
+        assert payload["accepted"] is True
+        reveal = payload["reveal"]
+        assert set(reveal) == {"placebo", "correct_side", "same_segment", "sides"}
+
         if question.bitrate is None:
-            assert payload["correct_side"] is None
+            assert reveal["placebo"] is True
+            assert reveal["correct_side"] is None
+            assert reveal["sides"]["a"] == reveal["sides"]["b"] == {"kind": "lossless", "bitrate": None}
         else:
-            assert payload["correct_side"] == ("a" if question.lossless_is_a else "b")
+            assert reveal["placebo"] is False
+            assert reveal["correct_side"] == ("a" if question.lossless_is_a else "b")
+            sides = reveal["sides"]
+            kinds = {side: info["kind"] for side, info in sides.items()}
+            assert sorted(kinds.values()) == ["lossless", "mp3"]
+            coded = "b" if question.lossless_is_a else "a"
+            assert sides[coded] == {"kind": "mp3", "bitrate": question.bitrate}
+
+
+def test_answer_is_final_and_replay_is_idempotent(client, fast_config, long_source):
+    """首答即最终：改了选项只回 accepted=false 且不泄漏答案；同选项重放仍返回同样的揭晓。"""
+    item = upload(client, long_source)
+    session_id = start_session(client, [item["audio_id"]])["session_id"]
+    question = next(q for q in app_module.SESSIONS[session_id].questions if q.bitrate is not None)
+
+    first = _answer(client, session_id, question, "tie").json()
+    assert first["accepted"] is True and first["reveal"] is not None
+
+    replay = _answer(client, session_id, question, "tie").json()
+    assert replay["accepted"] is True
+    assert replay["reveal"] == first["reveal"], "同选项重放应当幂等"
+
+    changed = _answer(client, session_id, question, _correct_choice(question)).json()
+    assert changed["accepted"] is False
+    assert changed["reveal"] is None, "想先看答案再改分：不允许"
+    assert app_module.SESSIONS[session_id].answers[question.question_id]["choice"] == "tie"
+
+    result = client.get("/api/result", params={"session_id": session_id}).json()
+    assert result["real_correct"] == 0, "被忽略的修改不得计分"
 
 
 # ---------------------------------------------------------------------------
