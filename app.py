@@ -1680,6 +1680,14 @@ async def api_clear_cache() -> dict:
 
 
 if __name__ == "__main__":  # pragma: no cover
+    # 最省事的启动入口：`python app.py`（等价于 uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1）。
+    # 这里直接传 app 对象、不用 "app:app" 字符串，省掉一次模块导入；会话在内存里，所以固定单进程。
+    # HOST / PORT 环境变量可覆盖，与 Makefile 的约定一致。
     import uvicorn
 
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, workers=1)
+    _host = os.environ.get("HOST", "0.0.0.0")
+    _port = int(os.environ.get("PORT", "8000"))
+    print(f"TinEar 启动中：http://localhost:{_port}    （按 Ctrl+C 停止）")
+    if _host == "0.0.0.0":
+        print("提示：绑定 0.0.0.0 会对局域网开放，而界面没有认证；共享/不可信网络请用 HOST=127.0.0.1 启动。")
+    uvicorn.run(app, host=_host, port=_port)

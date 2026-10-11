@@ -41,7 +41,7 @@ soundfile 做解码、对齐与响度分析；前端是**原生 HTML/CSS/JS**（
 
 ## 快速开始
 
-### 方式一：venv（通用，推荐给新同学）
+### 最省事：一条 `python app.py`
 
 **macOS / Linux / WSL**
 
@@ -49,7 +49,7 @@ soundfile 做解码、对齐与响度分析；前端是**原生 HTML/CSS/JS**（
 git clone https://github.com/ID-izlq-Github/tin_ear.git && cd tin_ear
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1
+.venv/bin/python app.py
 ```
 
 **Windows（PowerShell / CMD）**
@@ -59,15 +59,39 @@ git clone https://github.com/ID-izlq-Github/tin_ear.git
 cd tin_ear
 python -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python app.py
+```
+
+然后在浏览器打开 <http://localhost:8000>（启动时终端会把它打印出来）。
+
+`app.py` 自带启动入口，等价于 `uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1`（单进程，
+会话存在内存里）。要换地址或端口用环境变量：
+
+```bash
+HOST=127.0.0.1 PORT=9000 .venv/bin/python app.py            # macOS / Linux / WSL
+```
+```pwsh
+$env:HOST="127.0.0.1"; $env:PORT="9000"; .venv\Scripts\python app.py   # Windows
+```
+
+> - 默认绑 `0.0.0.0`（WSL / 虚拟机里服务 + 宿主机浏览器访问就靠它）；原生 Windows 想更保守就用上面的
+>   `HOST=127.0.0.1`。安全性说明见「安全提示」。
+> - 首次盲测要等几秒生成音频，页面会显示**进度条**；之后的重复测试是秒开（细节见「使用流程」）。
+
+### 方式一：显式 uvicorn 命令（等价，参数看得见）
+
+想自己控制 host / port / 日志级别，或者以后要用 `--reload` 开发时用这条（环境与上面完全相同）：
+
+```bash
+# macOS / Linux / WSL
+.venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1
+```
+```pwsh
+# Windows
 .venv\Scripts\python -m uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-然后在浏览器打开 <http://localhost:8000>。
-
-> - `--workers 1` 不是可选项：测试会话保存在内存里，起多个 worker 会出现"这个进程没这个会话"的随机报错。
-> - **WSL 用户**：服务在 WSL 里、浏览器在 Windows 侧，请用 `--host 0.0.0.0`（只绑 `127.0.0.1` 时
->   Windows 侧经常连不上）；原生 Windows 用上面的 `127.0.0.1` 即可（更安全）。
-> - 首次盲测要等几秒生成音频，页面会显示**进度条**；之后的重复测试是秒开（细节见「使用流程」）。
+`--workers 1` 不是可选项：测试会话保存在内存里，起多个 worker 会出现"这个进程没这个会话"的随机报错。
 
 ### 方式二：Makefile（作者自用，conda 环境名 `tin_ear`，仅 macOS / Linux / WSL）
 
@@ -82,11 +106,11 @@ make help        # 看全部目标与当前使用的解释器
 
 `PY` / `HOST` / `PORT` 都可以覆盖，例如 `make run PY=.venv/bin/python HOST=127.0.0.1`。
 
-### 安全提示（两种方式都适用）
+### 安全提示（所有启动方式都适用）
 
 这是一个**本地单用户**工具，接口**没有任何认证** —— 谁能访问到这个端口，谁就能看你的音频库、删你的文件、
-替你开始测试。方式一在 macOS / Linux / WSL 上用的是 `--host 0.0.0.0`（为了 WSL / 虚拟机 + 宿主机浏览器），
-这等于对局域网开放：
+替你开始测试。最省事的 `python app.py` 与方式一在 macOS / Linux / WSL 上用的是 `0.0.0.0`
+（为了 WSL / 虚拟机 + 宿主机浏览器），这等于对局域网开放：
 
 - 家里的单人机器无所谓（Windows 防火墙默认还会拦外部入站）；
 - 在公共 Wi-Fi、宿舍网、公司网里请改用 `--host 127.0.0.1`（WSL 里浏览器在 Windows 侧连不上时，
@@ -95,7 +119,8 @@ make help        # 看全部目标与当前使用的解释器
 ### 本项目对环境的影响
 
 - 运行时临时文件（上传落盘、ffmpeg 中间文件、测试合成音频）都写在项目内 `data/tmp/`：用 `make`
-  时由 `TMPDIR` 指定，直接 `python -m uvicorn` 时由 `app.py` 启动时设置 `tempfile.tempdir` 兜底 ——
+  时由 `TMPDIR` 指定，`python app.py` / `python -m uvicorn` 时由 `app.py` 启动时设置
+  `tempfile.tempdir` 兜底 ——
   这样这些动辄几百 MB 的草稿一来看得见、二来删一个 `data/tmp` 就干净了（界面按钮/`make clean` 同理）。
 - pip 下载缓存**不重定向**，走 pip 自己的默认位置（Linux/macOS `~/.cache/pip`，Windows
   `%LOCALAPPDATA%\pip\Cache`）；要清就 `python -m pip cache purge`。
@@ -203,7 +228,7 @@ data/
 | pip 下载缓存 | pip 自己的位置（**不在项目里**） | `python -m pip cache purge` | 下次 install 重新下载 | — |
 | `data/library/` | **你自己导入的音频母版** | ❌ 别删（要删请用界面上的「删除」按钮，会同时清掉它的缓存） | 重新导入 | 视曲目长度，无损母版通常 30～50 MB/首 |
 
-方式一（venv）用户的等价命令（在项目根目录执行）：
+没装 Makefile 那套（即 `python app.py` / 方式一）的等价命令，在项目根目录执行：
 
 ```bash
 # macOS / Linux / WSL
@@ -254,10 +279,10 @@ Get-ChildItem -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Fo
 ## 测试
 
 ```bash
-make test    # 方式二：70 项，约 1 分钟（需要先 make install-dev 装过 pytest/httpx）
+make test    # 方式二：71 项，约 1 分钟（需要先 make install-dev 装过 pytest/httpx）
 ```
 
-方式一（venv）用户没有 `make` 也能跑，关键是别把临时文件丢到系统 temp 里：
+不用 Makefile（`python app.py` / 方式一）也能跑，关键是别把临时文件丢到系统 temp 里：
 
 ```bash
 # macOS / Linux / WSL

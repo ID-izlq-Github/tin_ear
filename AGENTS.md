@@ -29,7 +29,7 @@ TinEar — 本地音频盲测工具。用户管理本地音频库，选 1～3 �
 
 ```
 tinear/
-  app.py                  # 后端全部逻辑，单文件
+  app.py                  # 后端全部逻辑，单文件（`python app.py` 就是最省事的启动入口）
   static/
     index.html
     app.js
@@ -361,8 +361,8 @@ A/B 下面有**试听音量滑条**（−40 dB…0 dB，到底 = 静音；`↑/�
 
 ## 9. 验收标准
 
-1. `pip install -r requirements.txt && uvicorn app:app --host 0.0.0.0 --port 8000` 直接跑
-   （前提：系统已有 `ffmpeg` / `ffprobe`）。
+1. `pip install -r requirements.txt && python app.py` 直接跑（更显式的写法是
+   `uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1`；前提：系统已有 `ffmpeg` / `ffprobe`）。
 2. 浏览器访问 `http://localhost:8000` 走通导入、测试、结果（作者在 Windows 浏览器上验证）。
 3. FLAC / WAV / AIFF 可导入，导入后为 48 kHz FLAC。
 4. MP3 / AAC / OGG / Opus 被拒绝，前端显示明确错误。
@@ -389,7 +389,7 @@ A/B 下面有**试听音量滑条**（−40 dB…0 dB，到底 = 静音；`↑/�
 21. **详细模式预热快速补集**：冷缓存跑详细 → 响应里 `prewarmed >= 1`；紧接着切快速 →
     `generated == 0`（预热前这一步要补 1 对、约 0.7 s）。`PREWARM_SHORT_COMPLEMENT = False` 可关闭。
 
-自动化覆盖对照（`make test`，70 项）：#1 见 README 的安装/运行两行命令；#3/#4/#5 由 `test_api.py`
+自动化覆盖对照（`make test`，71 项）：#1 见 README 的安装/运行两行命令；#3/#4/#5 由 `test_api.py`
 的导入与拒绝用例覆盖；#6/#10/#11 由清理用例覆盖（含硬链接 inode 断言、"答完/结束后才能删除"的回归用例，
 以及 `test_clear_cache_only_touches_stimuli_cache`：**「清理测试音频缓存」只清 `data/cache`**，
 不碰 `data/tmp` / `data/session` / `data/library`）；
@@ -443,11 +443,16 @@ README 的「它不做什么」是同一份清单的**用户口径**（只留用
 # 前置：系统已有 ffmpeg / ffprobe（实测 6.1.1）；本项目不 apt install、不装任何全局包
 make install     # = pip install -r requirements.txt（解释器自动探测，可用 PY= 覆盖）
 make run         # 前台启动（Ctrl+C 停止）；或 make run-bg 后台启动 + make stop 停止
-make test        # 70 项自动化测试（需要 make install-dev）
+make test        # 71 项自动化测试（需要 make install-dev）
 ```
 
 - **解释器**：`Makefile` 的 `PY` 会按「项目内 `.venv` → 作者的 conda 环境 `tin_ear` → `python3` → `python`」
   自动挑选，也可以用 `make run PY=/path/to/python` 覆盖。`HOST`（默认 `0.0.0.0`）与 `PORT`（默认 `8000`）同样可覆盖。
+- **最省事的启动入口**：`python app.py` —— 就是 §16 里的 `__main__` 块，读 `HOST` / `PORT` 环境变量
+  （默认 `0.0.0.0:8000`）、打印访问地址与"0.0.0.0 无认证"的提示，然后 `uvicorn.run(app, …)`。
+  直接传 app 对象而不是 `"app:app"` 字符串：省掉一次模块导入，也避免两个 `FastAPI` 实例。
+  **固定单进程**（会话在内存里）。由 `test_python_app_py_entry_point_serves_the_api` 守护 —— 它会真的
+  起子进程、轮询 `/api/library`，所以 README 首推的这条命令不会悄悄坏掉。
 - **公开仓库的可移植性**：README 给出通用 `venv` 路线；`make` 只是作者自用的便捷层，
   任何机器上 `python -m uvicorn app:app` 都能跑起来（只要装了 `requirements.txt` 与系统 ffmpeg）。
 - **安全**：这是本地单用户工具，接口无认证。默认绑 `0.0.0.0` 是为了虚拟机 + 宿主机浏览器访问；
@@ -518,6 +523,9 @@ make test        # 70 项自动化测试（需要 make install-dev）
 
 **环境与文档**
 
+- **保留 `python app.py` 作为首推启动方式**：README 的"最省事"一节用它，显式 uvicorn 命令与 `make run`
+  退居"参数看得见/作者自用"。理由：新用户记不住 `--workers 1` 与 `-m uvicorn app:app` 这一串，
+  而入口本来就在 `__main__` 里；顺带把地址与安全提示打印出来（WSL 场景最需要）。
 - **用户可见的名词统一叫「测试音频」**：`stimulus/刺激` 是心理声学的正式术语，但在中文 UI 里第一联想
   是电刺激，读起来怪。只改**面向用户**的文案与错误信息；内部标识（`stimuli/` 目录、
   `STIMULI_ALGO_VERSION`、`_ensure_stimuli`、`STIMULUS_SUBTYPE`）保留 —— `STIMULUS_SUBTYPE` 更是
@@ -557,7 +565,11 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
   **「清理测试音频缓存」的作用域**（`test_clear_cache_only_touches_stimuli_cache`：只清 `data/cache`）、
   **准备进度端点**（`test_progress_endpoint_reports_generation`：未知 token 返回 `found: false`，
   完成后 `finished/done/total` 正确）、**前端进度条接线**（`test_frontend_prepare_progress_is_wired`）、
-  启动清理、TTL 清理、路径穿越。
+  启动清理、TTL 清理、路径穿越；以及一条特殊的端到端用例
+  **`test_python_app_py_entry_point_serves_the_api`**（守护 README 首推的 `python app.py`）：
+  把 `app.py` 与 `static/` 复制到临时目录再起真子进程（`HOST=127.0.0.1 PORT=<空闲端口>`），
+  轮询 `/api/library` 直到 200 再把进程收掉。**不能**直接在当前工作区起子进程 ——
+  `_bootstrap()` 会清空 `data/tmp`，而那正是 pytest 临时目录所在的地方。
 - `pytest.ini`：`tmp_path_retention_policy = failed` + `tmp_path_retention_count = 1` —— 测试产物落在
   项目内 `data/tmp/`，合成音频一次就有几百 MB，默认策略会留下最近几轮（实测堆到 907 MB）。
   注意 `count = 1` 的含义是"会话级 `tmp_path_factory` 目录保留最近 1 轮"，所以**失败的那一轮**会留下
@@ -611,13 +623,14 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 
 ## 16. 项目现状（交接摘要）
 
-- **状态**：功能完整可用。`make test` **70 项**全绿（约 1 分钟）。
+- **状态**：功能完整可用。`make test` **71 项**全绿（约 1 分钟）。
 - **改动历史**：看 `git log --oneline`（最近一次：缓存顺序无关 + 并发生成 + 进度条 + 术语改「测试音频」
   + 环境配置与文档收敛）。历史上修过的真问题都在 §15，不必从提交信息里考古。
 - **关键实测**：每对 ΔLUFS = 0.0000 LU、真峰值 ≈ −5.3 dBTP（−18 LUFS 下）、两路各 5760088 字节（无体积泄漏）、
   22 题详细模式**串行 15.8 s / 8 路并发 3.9 s**、缓存复用 0.01 s、测试音频缓存 245.8 MB/首、
   详细模式顺手预热后**两个方向切换都是 0.01 s**、`POWER_REQUIRED_N = 7`。完整表见 §15。
 - **待人工验证**：验收 #2（浏览器实操，含新的进度条）与 #7 的主观听感；其余 20 条已自动化（对照表见 §9）。
+  验收 #1（安装即跑）现在由 `python app.py` 这条命令覆盖，并有测试真的把子进程起起来探活。
 - **已定位并修掉的测试假阳性**：`test_question_does_not_leak_bitrate_or_codec` 曾约每十轮挂一次，
   现象是 `assert '96' not in '47398a8e90e79657'`。根因**不在产品代码**：不透明 token 是随机 16 位 hex，
   15 个两位窗口里出现 `96` 的概率实测 **5.74%**，而那条断言把"token 恰好含码率数字"误判成泄漏

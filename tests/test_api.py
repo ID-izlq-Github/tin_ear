@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import itertools
+import json
 import os
+import shutil
+import socket
 import subprocess
+import sys
+import time
+import urllib.request
 
 import pytest
 import soundfile as sf
@@ -12,6 +18,7 @@ from fastapi.testclient import TestClient
 
 import app as app_module
 from conftest import (
+    PROJECT_ROOT,
     cache_wavs,
     start_session,
     stream_types,
@@ -795,3 +802,55 @@ def test_static_index_is_served(client):
     response = client.get("/")
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
+
+
+def test_python_app_py_entry_point_serves_the_api(tmp_path):
+    """README 首推的启动方式 `python app.py` 必须真能起来。
+
+    做法：把 app.py 与 static/ 复制到临时目录，再在那边起子进程（`HOST=127.0.0.1 PORT=<空闲端口>`），
+    轮询 /api/library 直到 200，最后把进程收掉。
+
+    **不能**直接在当前工作区起子进程：app.py 的 `_bootstrap()` 会清空 data/tmp，
+    而那正是 pytest 放临时目录的地方（会把本轮测试的合成音频删掉）。
+    """
+    project = tmp_path / "proj"
+    project.mkdir()
+    shutil.copy(PROJECT_ROOT / "app.py", project / "app.py")
+    shutil.copytree(PROJECT_ROOT / "static", project / "static")
+
+    with socket.socket() as probe:  # 向系统要一个空闲端口，避免和别的实例撞车
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    env = {**os.environ, "HOST": "127.0.0.1", "PORT": str(port)}
+    proc = subprocess.Popen(
+        [sys.executable, "app.py"],
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        deadline = time.time() + 30
+        payload = None
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                raise AssertionError(f"`python app.py` 提前退出：\n{proc.stdout.read()}")
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/library", timeout=1
+                ) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                break
+            except Exception:  # 端口还没起来：绝大多数是 ConnectionRefusedError
+                time.sleep(0.2)
+        assert payload is not None, "30 秒内没能通过 `python app.py` 把服务起来"
+        assert payload["items"] == [], payload
+        assert payload["cache_bytes"] == 0, "临时目录里应该是全新的空库"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:  # pragma: no cover - 正常路径不会走到
+            proc.kill()
