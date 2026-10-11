@@ -64,7 +64,8 @@ SEGMENT_STEP_SECONDS = 5
 SEGMENT_SAMPLES = SAMPLE_RATE * SEGMENT_SECONDS  # 720000 = 恰好 625 个 MP3 帧
 SEGMENT_FADE_SECONDS = 0.02
 SEGMENT_ALGO_VERSION = 1
-STIMULI_ALGO_VERSION = 2  # 测试音频缓存版本：任何改变其内容的常量/参数都要 bump
+STIMULI_ALGO_VERSION = 3  # 测试音频缓存版本：任何改变其内容的常量/参数都要 bump
+                          # （v2：TARGET_LUFS -23 → -18；v3：STIMULUS_SUBTYPE FLOAT → PCM_24）
 #                           （v2：TARGET_LUFS 由 -23 提到 -18 LUFS）
 
 TARGET_LUFS = -18.0
@@ -101,7 +102,15 @@ ALIGN_PROBE_SECONDS = 6
 ALIGN_REFINE_SECONDS = 8
 ALIGN_MAX_LAG = 8192
 ALIGN_REFINE_SPAN = 64
-STIMULUS_SUBTYPE = "FLOAT"  # 回退项 "PCM_24"
+# 交付给浏览器的 WAV 位深。内容不变，只影响磁盘/传输：
+#   FLOAT   5,760,088 B/文件，逐位透明，但带一个含时间戳的 PEAK chunk；
+#   PCM_24  4,320,044 B（-25%），量化噪声底 ≈ -149 dBFS；
+#   PCM_16  2,880,044 B（-50%），量化噪声底 ≈ -101 dBFS（= CD 精度）。
+# 对照：32 kbps MP3 的伪影在 -40 dBFS 上下，所以 24 与 16 bit 都不可能成为线索；
+# 选 24 而不是 16 是为了不动"参考侧"的精度，也是为了 24-bit WAV 在浏览器里少踩坑。
+# 换这个常量必须 bump STIMULI_ALGO_VERSION（内容变了），并重跑 §15 的体积/自检数字。
+STIMULUS_SUBTYPE = "PCM_24"
+STIMULUS_BITS = {"FLOAT": 32, "PCM_24": 24, "PCM_16": 16}
 STIMULI_CONCURRENCY_MAX = 8  # 单题生成实测 ~0.70 s，8 路之后基本饱和（见 AGENTS.md §15）
 
 
@@ -322,6 +331,64 @@ def _read_audio(path: Path) -> np.ndarray:
 def _write_wav(path: Path, data: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(path), data, SAMPLE_RATE, subtype=STIMULUS_SUBTYPE, format="WAV")
+
+
+def _write_wav_atomic(path: Path, data: np.ndarray) -> None:
+    """先写临时文件再原子替换（`os.replace`）。
+
+    并发生成时，同一片段的多个码率会写**同一个**共享无损文件（见 `_ensure_stimuli`）；
+    直接往目标路径写，后到的任务可能截断别人刚写完的文件、或让检查方读到半截数据。
+    内容按构造就是逐位相同的，所以谁最后到都一样。
+    """
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
+    _write_wav(tmp, data)
+    os.replace(tmp, path)
+
+
+def _stimulus_lsb() -> float:
+    """当前 `STIMULUS_SUBTYPE` 的量化台阶（满刻度 = 1.0；浮点返回 0.0）。"""
+    bits = STIMULUS_BITS.get(STIMULUS_SUBTYPE)
+    if bits is None:
+        raise AudioToolError(f"未知的 STIMULUS_SUBTYPE：{STIMULUS_SUBTYPE!r}")
+    return 0.0 if STIMULUS_SUBTYPE == "FLOAT" else 2.0 ** (1 - bits)
+
+
+def _verify_written_pair(path_ll: Path, path_mp3: Path, out_ll: np.ndarray, out_mp3: np.ndarray) -> None:
+    """以**落盘文件**为准做结构自检（整数位深下内存数组 != 交付字节）。
+
+    `_prepare_pair` 的自检测的是内存里的 float 数组（长度、ΔLUFS、真峰值）。改成整数位深后，
+    交付的字节是那份数组的量化结果，所以这里补三项关于**文件**的硬事实：
+
+    1. 子类型确实是我们要的（防 libsndfile 静默降级）；
+    2. 两路采样数与**字节数**完全相等（验收 #8 的"无体积泄漏"靠的就是这一条）；
+    3. 每个采样与已通过自检的数组相差 <= 1.5 LSB（只可能是量化，不可能夹带别的处理）。
+
+    有了 3 就能推出交付文件仍然满足 `_prepare_pair` 的全部结论：24 bit 的 1 LSB = 2^-23 ≈ -138 dBFS，
+    经 4× 过采样核（L1 范数略大于 1）放大后仍在 -130 dBFS 量级，比 0.05 dB / -1 dBTP 的容差低三个
+    数量级。**这套推断由 `test_stimulus_metadata_matches_written_files` 实测把关**（它把落盘文件
+    重新解码后重算 LUFS/真峰值，与索引里的记录比对），所以这里不再重复付一次 ~182 ms/题的测量开销
+    （那会让冷启动从 4.8 s 涨到 6.0 s）。
+    """
+    tolerance = 1.5 * _stimulus_lsb() + 1e-6  # 浮点子类型走 1e-6（实际逐位相等）
+    for path, source in ((path_ll, out_ll), (path_mp3, out_mp3)):
+        info = sf.info(str(path))
+        if info.subtype != STIMULUS_SUBTYPE:
+            raise AudioToolError(f"落盘子类型异常：{info.subtype} != {STIMULUS_SUBTYPE}")
+        if info.frames != SEGMENT_SAMPLES:
+            raise AudioToolError(f"落盘长度异常：{info.frames} != {SEGMENT_SAMPLES}")
+        disk, sr = sf.read(str(path), dtype="float32", always_2d=True)
+        if sr != SAMPLE_RATE:
+            raise AudioToolError(f"落盘采样率异常：{sr} != {SAMPLE_RATE}")
+        reference = np.asarray(_fit_length(source)[0], dtype=np.float64)
+        drift = float(np.max(np.abs(np.asarray(disk, dtype=np.float64) - reference)))
+        if drift > tolerance:
+            raise AudioToolError(
+                f"落盘内容与已自检数组相差 {drift:.3e}（容差 {tolerance:.3e}），不只是量化误差"
+            )
+    if path_ll.stat().st_size != path_mp3.stat().st_size:
+        raise AudioToolError(
+            f"两路字节数不等（{path_ll.stat().st_size} vs {path_mp3.stat().st_size}），会从体积泄漏答案"
+        )
 
 
 def _integrated_loudness(x: np.ndarray, sr: int = SAMPLE_RATE) -> float:
@@ -867,16 +934,36 @@ async def _ensure_stimuli(
     out_ll, out_mp3, info = await asyncio.to_thread(_prepare_pair, master, cand)
 
     cache_root.mkdir(parents=True, exist_ok=True)
+    # 无损侧的内容只由 (片段, common_delta) 决定 —— `master_fit` 与 `g_ll` 都只依赖片段，
+    # 所以 delta 相同的两个码率算出来逐位相同。delta == 0（默认情况：-18 LUFS 下真峰值
+    # 还有 4 dB 余量）时让整个片段共用一份 `seg{S}_ll.wav`，无损侧从 N 份降到 1 份。
+    # delta != 0（把 TARGET_LUFS 调得很高才会发生）时退回每档一份，保证自检结论不被共享破坏：
+    # 共用只在"这份文件就是 delta=0 的那份"时成立，而 delta=0 的判据与内容一一对应。
+    # 注：delta 存的是四舍五入到 1e-4 dB 的值，被归入 0 的偏差 <= 5e-4 dB，
+    # 远小于自检容差 TRUE_PEAK_SLACK_DB = 0.05，既不会让峰值超标也不影响 ΔLUFS。
+    shared_ll = info["gain_db"]["common_delta"] == 0.0
+    ll_name = f"seg{seg_index}_ll.wav" if shared_ll else f"{key}_ll.wav"
+
     if bitrate is None and (PLACEBO_SAME_SEGMENT or alt_seg is None):
-        path = cache_root / f"{key}.wav"
-        await asyncio.to_thread(_write_wav, path, out_ll)
-        files = {"ll": path.name, "mp3": path.name}
+        # 安慰剂：A/B 是同一份文件。delta == 0 时它和无损侧本来就是同一份内容，直接共用。
+        if shared_ll:
+            path_ll = path_mp3 = cache_root / ll_name
+            await asyncio.to_thread(_write_wav_atomic, path_ll, out_ll)
+            files = {"ll": ll_name, "mp3": ll_name}
+        else:
+            path_ll = path_mp3 = cache_root / f"{key}.wav"
+            await asyncio.to_thread(_write_wav_atomic, path_ll, out_ll)
+            files = {"ll": path_ll.name, "mp3": path_ll.name}
     else:
-        path_ll = cache_root / f"{key}_ll.wav"
+        path_ll = cache_root / ll_name
         path_mp3 = cache_root / f"{key}_mp3.wav"
-        await asyncio.to_thread(_write_wav, path_ll, out_ll)
-        await asyncio.to_thread(_write_wav, path_mp3, out_mp3)
+        await asyncio.to_thread(_write_wav_atomic, path_ll, out_ll)
+        await asyncio.to_thread(_write_wav_atomic, path_mp3, out_mp3)
         files = {"ll": path_ll.name, "mp3": path_mp3.name}
+
+    # 整数位深下"内存数组"和"交付字节"不是一回事：这里以落盘文件为准补一次结构自检，
+    # 证明交付内容只是那份数组的量化（详见 `_verify_written_pair` 的说明）。
+    await asyncio.to_thread(_verify_written_pair, path_ll, path_mp3, out_ll, out_mp3)
 
     entry = {
         "key": key,

@@ -154,6 +154,26 @@ def test_loudness_match_across_bitrates(segment_pair, tmp_path):
         assert 0 <= info["lag_samples"] <= app_module.ALIGN_MAX_LAG
 
 
+def test_lossless_side_is_bit_identical_across_bitrates(segment_pair, tmp_path):
+    """无损侧共享的**前提**：它的内容只由 (片段, common_delta) 决定。
+
+    `master_fit` 与 `g_ll` 都只依赖片段，所以只要 `common_delta == 0`（默认情况：-18 LUFS
+    下真峰值还有 4 dB 余量），不同码率算出的无损侧必须**逐位相同** —— `_ensure_stimuli`
+    正是靠这一条才敢让整个片段共用一份 `seg{S}_ll.wav`。前提不成立时代码会退回每档一份
+    （结果仍然正确，只是空间优化失效），所以这条挂了说明"优化失效"，不是"算错了"。
+    """
+    master, _, flac = segment_pair
+    canonical: list[np.ndarray] = []
+    for bitrate in (64, 128, 320):
+        mp3 = encode_mp3(flac, tmp_path / f"share_{bitrate}.mp3", bitrate)
+        out_ll, _, info = app_module._prepare_pair(master, decode_f32(mp3))
+        if info["gain_db"]["common_delta"] == 0.0:
+            canonical.append(out_ll)
+    assert len(canonical) >= 2, "本素材在 -18 LUFS 下应有多档 delta == 0，才能验证共享前提"
+    for out_ll in canonical[1:]:
+        assert np.array_equal(canonical[0], out_ll), "delta == 0 时无损侧必须逐位相同"
+
+
 # ---------------------------------------------------------------------------
 # 片段选择（走真实 API 路径）
 # ---------------------------------------------------------------------------
@@ -307,6 +327,80 @@ def test_placebo_pair_is_single_identical_file(client, fast_config, long_source)
         assert placebo["true_peak_db"] <= app_module.TRUE_PEAK_DBTP + app_module.TRUE_PEAK_SLACK_DB
 
 
+def test_lossless_reference_is_shared_across_bitrates(client, monkeypatch, long_source):
+    """同一个片段的所有码率共用一份无损侧（delta == 0 时的确定性去重）。
+
+    细测 20 对真实测试音频的无损侧因此从 20 个文件降到"每片段 1 个"（2 个）。
+    安慰剂 A/B 本来就同文件，delta == 0 时它和无损侧是同一份内容，一并共用。
+    """
+    monkeypatch.setattr(app_module, "SHORT_TEST_BITRATES", [64, 128, 320])
+    monkeypatch.setattr(app_module, "SHORT_TEST_TOTAL", 7)  # 6 真实 + 1 安慰剂 → 每片段 3 档
+    audio_id = upload(client, long_source)["audio_id"]
+    start_session(client, [audio_id])
+
+    root = app_module._stimuli_dir(audio_id)
+    index = json.loads((root / "index.json").read_text("utf-8"))
+    entries = index["entries"]
+    real = [e for e in entries.values() if e["bitrate"] is not None]
+    segs = sorted({e["seg"] for e in real})
+    assert segs == [0, 1], "65 秒素材应切出两个片段"
+    assert len(real) == 6 and len(entries) == 7
+
+    # 每个片段一份无损侧，该片段的所有题目（真实 + 安慰剂）都指向它
+    for seg in segs:
+        consumers = [e for e in entries.values() if e["seg"] == seg]
+        assert {e["files"]["ll"] for e in consumers} == {f"seg{seg}_ll.wav"}
+        for entry in consumers:
+            assert entry["gain_db"]["common_delta"] == 0.0, entry["key"]
+            assert entry["lufs_diff"] <= app_module.MAX_LUFS_DIFF_LU
+            assert entry["true_peak_db"] <= app_module.TRUE_PEAK_DBTP + app_module.TRUE_PEAK_SLACK_DB
+
+    # 磁盘上正好是：每片段 1 个无损侧 + 6 个压缩侧（安慰剂不再单独占文件）
+    expected = {f"seg{s}_ll.wav" for s in segs} | {
+        f"seg{e['seg']}_{e['bitrate']}k_mp3.wav" for e in real
+    }
+    assert len(expected) == 8, "6 对真实测试音频：2 个共享无损侧 + 6 个压缩侧"
+    assert {path.name for path in cache_wavs(audio_id)} == expected
+
+
+def test_sharing_falls_back_when_peak_attenuation_is_needed(
+    client, fast_config, long_source, monkeypatch
+):
+    """把 TARGET_LUFS 调高到触发共同峰值衰减时，无损侧必须退回每档一份。
+
+    无损侧的内容由 (片段, common_delta) 共同决定，所以共享的判据只能是
+    `common_delta == 0`：一旦某对题的真峰值顶到 -1 dBTP（这里 -6 LUFS 必然发生），
+    那份 `_ll` 就只属于它自己，不能拿 `seg{S}_ll.wav` 去顶。
+    """
+    monkeypatch.setattr(app_module, "TARGET_LUFS", -6.0)
+    audio_id = upload(client, long_source)["audio_id"]
+    start_session(client, [audio_id])
+
+    root = app_module._stimuli_dir(audio_id)
+    index = json.loads((root / "index.json").read_text("utf-8"))
+    entries = index["entries"]
+    shared_names = {f"seg{seg}_ll.wav" for seg in {e["seg"] for e in entries.values()}}
+    fell_back: list[str] = []
+
+    for key, entry in entries.items():
+        assert entry["lufs_diff"] <= app_module.MAX_LUFS_DIFF_LU
+        assert entry["true_peak_db"] <= app_module.TRUE_PEAK_DBTP + app_module.TRUE_PEAK_SLACK_DB
+        shared = entry["gain_db"]["common_delta"] == 0.0
+        if entry["bitrate"] is None:
+            # 安慰剂 A/B 是同一份文件；delta == 0 时它就是该片段的无损侧
+            assert entry["files"]["ll"] == entry["files"]["mp3"]
+        if shared:
+            expected = f"seg{entry['seg']}_ll.wav"
+        else:
+            expected = f"{key}.wav" if entry["bitrate"] is None else f"{key}_ll.wav"
+            fell_back.append(key)
+        assert entry["files"]["ll"] == expected, (key, entry["files"], entry["gain_db"])
+        assert shared or entry["files"]["ll"] not in shared_names, "delta < 0 的题目不能吃共享的无损侧"
+
+    assert fell_back, "这个响度目标必须至少触发一次峰值衰减，否则测不到回退分支"
+    assert not any((root / name).exists() for name in set(fell_back) & shared_names)
+
+
 def test_stimulus_wav_headers_are_canonical(client, fast_config, long_source):
     item = upload(client, long_source)
     start_session(client, [item["audio_id"]])
@@ -315,8 +409,91 @@ def test_stimulus_wav_headers_are_canonical(client, fast_config, long_source):
         assert info.samplerate == app_module.SAMPLE_RATE
         assert info.channels == app_module.CHANNELS
         assert info.frames == app_module.SEGMENT_SAMPLES
-        assert info.subtype == "FLOAT"
+        assert info.subtype == app_module.STIMULUS_SUBTYPE
         assert info.format == "WAV"
+        # 固定位深 → 字节数只由长度与位深决定、与内容无关（验收 #8 的"两路等长"靠这一条）。
+        # 整数位深还顺带没有 libsndfile 的 PEAK chunk（那个 chunk 带时间戳），所以整个文件
+        # 就是 44 字节规范头 + 采样数据，连字节级可比。
+        width = app_module.STIMULUS_BITS[app_module.STIMULUS_SUBTYPE] // 8
+        payload = app_module.SEGMENT_SAMPLES * app_module.CHANNELS * width
+        header = path.stat().st_size - payload
+        assert header == (88 if app_module.STIMULUS_SUBTYPE == "FLOAT" else 44), (path.name, header)
+
+
+def test_stimulus_subtype_lsb_mapping(monkeypatch):
+    """位深常量与量化台阶必须对得上（`STIMULUS_BITS` 是唯一的换算来源）。"""
+    assert app_module.STIMULUS_BITS[app_module.STIMULUS_SUBTYPE] == 24
+    assert app_module._stimulus_lsb() == 2.0 ** -23
+    monkeypatch.setattr(app_module, "STIMULUS_SUBTYPE", "PCM_16")
+    assert app_module._stimulus_lsb() == 2.0 ** -15
+    monkeypatch.setattr(app_module, "STIMULUS_SUBTYPE", "FLOAT")
+    assert app_module._stimulus_lsb() == 0.0
+    monkeypatch.setattr(app_module, "STIMULUS_SUBTYPE", "MP3")
+    with pytest.raises(app_module.AudioToolError):
+        app_module._stimulus_lsb()
+
+
+def test_written_pair_verification_rejects_mismatch(tmp_path):
+    """落盘自检必须真的会拦 —— 否则它只是一段装饰代码。"""
+    seconds = app_module.SEGMENT_SECONDS
+    source = synth_signal(seconds, seed=9)
+    path = tmp_path / "pair.wav"
+    sf.write(str(path), source, SR, subtype=app_module.STIMULUS_SUBTYPE, format="WAV")
+
+    app_module._verify_written_pair(path, path, source, source)  # 正常路径不抛
+
+    tampered = source.copy()
+    tampered[1000] += 0.5  # 相当于"落盘的不只是量化"
+    with pytest.raises(app_module.AudioToolError, match="不只是量化误差"):
+        app_module._verify_written_pair(path, path, tampered, tampered)
+
+    short = tmp_path / "short.wav"
+    half = app_module.SEGMENT_SAMPLES // 2
+    sf.write(str(short), np.zeros((half, app_module.CHANNELS), dtype=np.float32), SR,
+             subtype=app_module.STIMULUS_SUBTYPE, format="WAV")
+    with pytest.raises(app_module.AudioToolError, match="落盘长度异常"):
+        app_module._verify_written_pair(path, short, source, source[:half])
+
+
+def test_stimulus_metadata_matches_written_files(client, fast_config, long_source):
+    """索引里的 LUFS / 真峰值必须描述**落盘文件**，而不只是内存里的 float 数组。
+
+    改成整数位深（`STIMULUS_SUBTYPE = "PCM_24"`）之后，交付的字节是那份数组的量化结果，
+    所以 `_prepare_pair` 的自检（只证明内存数组合规）不够；`_ensure_stimuli` 补的是
+    "落盘内容只是量化"这条结构事实，这里则**实测**这条推断的结论：把文件重新解码、重算
+    LUFS 与真峰值，与索引里的记录逐项比对。量化带来的偏差应 ≤ 1e-3 dB，而容差是 0.05 dB。
+    """
+    audio_id = upload(client, long_source)["audio_id"]
+    start_session(client, [audio_id])
+    root = app_module._stimuli_dir(audio_id)
+    index = json.loads((root / "index.json").read_text("utf-8"))
+    assert index["stimuli_algo_version"] == app_module.STIMULI_ALGO_VERSION
+    assert index["entries"], "应生成测试音频缓存"
+
+    measured: dict[str, tuple] = {}
+    for entry in index["entries"].values():
+        assert entry["lufs_diff"] <= app_module.MAX_LUFS_DIFF_LU, entry["key"]
+        for role, name in entry["files"].items():
+            if name not in measured:
+                path = root / name
+                data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+                assert sr == app_module.SAMPLE_RATE
+                assert len(data) == app_module.SEGMENT_SAMPLES
+                assert sf.info(str(path)).subtype == app_module.STIMULUS_SUBTYPE
+                measured[name] = (
+                    app_module._integrated_loudness(data),  # 实测，不是索引里的值
+                    app_module._true_peak_db(data),
+                    path.stat().st_size,
+                )
+            loud, _, _ = measured[name]
+            assert abs(loud - entry["lufs"][role]) <= 1e-3, (name, loud, entry["lufs"][role])
+        # 索引里的 true_peak_db 记的是**这一对的最坏一路**（`max(tp_a, tp_b)`），
+        # 而不是无损侧自己的峰值，所以按对比较。
+        pair_peak = max(measured[entry["files"]["ll"]][1], measured[entry["files"]["mp3"]][1])
+        assert abs(pair_peak - entry["true_peak_db"]) <= 1e-3, (entry["key"], pair_peak)
+        assert pair_peak <= app_module.TRUE_PEAK_DBTP + app_module.TRUE_PEAK_SLACK_DB, entry["key"]
+        # 两路字节数必须相等，否则体积本身就是答案
+        assert measured[entry["files"]["ll"]][2] == measured[entry["files"]["mp3"]][2]
 
 
 # ---------------------------------------------------------------------------
