@@ -337,7 +337,8 @@ def test_selection_order_does_not_change_stimulus_set(
     assert first["stimuli"]["generated"] == first["total"]
 
     second = start_session(client, [b, a])
-    assert second["stimuli"] == {"generated": 0, "reused": second["total"]}
+    assert second["stimuli"]["generated"] == 0
+    assert second["stimuli"]["reused"] == second["total"]
 
 
 def test_concurrent_stimuli_generation_is_identical_to_serial(client, monkeypatch, long_source):
@@ -356,7 +357,8 @@ def test_concurrent_stimuli_generation_is_identical_to_serial(client, monkeypatc
         started = start_session(client, [audio_id])
         root = app_module._stimuli_dir(audio_id)
         index = json.loads((root / "index.json").read_text("utf-8"))
-        assert len(index["entries"]) == started["total"], "并发下索引条目不能丢"
+        expected = started["total"] + started["stimuli"]["prewarmed"]
+        assert len(index["entries"]) == expected, "并发下索引条目不能丢"
         digests = {}
         for entry in index["entries"].values():
             for name in entry["files"].values():
@@ -400,6 +402,38 @@ def test_shared_locks_survive_multiple_event_loops(client, long_source):
         shutil.rmtree(cache_root, ignore_errors=True)
         asyncio.run(cold_segments())
     assert (cache_root / "meta.json").exists()
+
+
+def test_detailed_round_prewarms_short_complement(client, fast_config, long_source):
+    """详细模式顺手生成"快速模式才用到的那几对" → 之后切快速是 0 新生成。
+
+    快速 → 详细那 17 个组合的缺口是阶梯覆盖问题（详细 10 档 × 2 片段，快速只覆盖其中 5 个），
+    预热消不掉；但"详细 → 快速"这一侧的缺口可以被预热补平。
+    """
+    audio_id = upload(client, long_source)["audio_id"]
+
+    detailed = start_session(client, [audio_id], "detailed")
+    assert detailed["stimuli"]["generated"] == detailed["total"]
+    assert detailed["stimuli"]["prewarmed"] >= 1, "冷缓存下详细模式应当顺手预热快速模式的补集"
+
+    short = start_session(client, [audio_id], "short")
+    assert short["stimuli"]["generated"] == 0, "预热之后切快速不应再新生成"
+    assert short["stimuli"]["reused"] == short["total"]
+
+
+def test_prewarm_is_detailed_only_and_switchable(client, fast_config, long_source, monkeypatch):
+    audio_id = upload(client, long_source)["audio_id"]
+
+    short = start_session(client, [audio_id], "short")
+    assert short["stimuli"]["prewarmed"] == 0, "快速模式没有可预热的补集"
+
+    monkeypatch.setattr(app_module, "PREWARM_SHORT_COMPLEMENT", False)
+    client.delete("/api/cache")
+    detailed = start_session(client, [audio_id], "detailed")
+    assert detailed["stimuli"]["prewarmed"] == 0, "关掉开关就不该预热"
+
+    short = start_session(client, [audio_id], "short")
+    assert short["stimuli"]["generated"] == 1, "关掉预热后，切快速仍要补那 1 个组合"
 
 
 def test_progress_tracking_lifecycle():

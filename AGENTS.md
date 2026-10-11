@@ -114,6 +114,7 @@ FFMPEG_CONCURRENCY = STIMULI_CONCURRENCY       # ffmpeg 子进程槽位随任务
 MIN_SOURCE_SAMPLE_RATE, MIN_SOURCE_SECONDS = 44100, 30
 SHUFFLE_ALL_QUESTIONS = True       # 真实题与安慰剂题统一打乱，位置不携带任何信息
 PLACEBO_SAME_SEGMENT = True        # 默认：安慰剂 = 同一片段的两份无损拷贝
+PREWARM_SHORT_COMPLEMENT = True    # 详细模式顺手生成快速模式独有的那 1～2 对（见 §6）
 RESULT_BRACKETS = [(0, 96, "≤96 kbps"), (128, 192, "128–192 kbps"), (224, 10**9, "≥224 kbps")]
 CHANCE_LEVEL = 1.0 / 3.0           # 三选一（A/B/听不出）的瞎猜基线，不是 1/2
 ALPHA = 0.05                       # 单侧精确二项检验的显著性水平
@@ -135,7 +136,7 @@ n=5 需 4/5（p=0.045）、n=10 需 7/10（p=0.020）。详细模式 20 道真�
   作为测试音频缓存，版本不匹配即整目录重算。
 - 缓存键是 **`(audio_id, seg_index, bitrate)`**，没有任何淘汰/过期逻辑：生成过的组合永久保留，
   体积上限 = 两套阶梯并集 11 档 × 2 个片段 + 2 个安慰剂 = 46 个 WAV ≈ 267 MB/首（MiB 口径；只跑快速
-  模式约 70 MB/首、详细模式实测 245.8 MB/首）。**是否命中只取决于这一轮的题表**，
+  模式约 70 MB/首、详细模式实测 245.8 MB/首、加上它预热的快速补集约 257 MB/首）。**是否命中只取决于这一轮的题表**，
   而题表由「模式 + 素材集合」决定 —— `audio_ids` 在 `/api/start` 里按库内顺序排序，与前端勾选顺序无关，
   所以同素材重测必然 100% 复用（曾经因为直接用勾选顺序做 round-robin，换一下勾选先后就"部分重生成"）。
 - `session/` 与 `tmp/` 临时。后端启动清空（`data/library/`、`data/cache/` 保留）。
@@ -199,6 +200,12 @@ n=5 需 4/5（p=0.045）、n=10 需 7/10（p=0.020）。详细模式 20 道真�
   `min(可用核数, STIMULI_CONCURRENCY_MAX=8)`（`_resolve_concurrency()`，`TINEAR_CONCURRENCY` 可覆盖；
   核数优先取 `os.sched_getaffinity(0)`，Windows 回退 `os.cpu_count()`）。`_FFMPEG_SEM` 与它同容量 ——
   原来的 `FFMPEG_CONCURRENCY = 2` 是写死的，而且因为逐题串行，实际永远只用得到 1。
+- **详细模式顺手预热快速补集**（`PREWARM_SHORT_COMPLEMENT`）：`/api/start` 在 detailed 模式下会再跑一次
+  `_build_questions("short", …)`，取它的请求集合与 detailed 的差集（通常只有 1 对，即 224 kbps 那一对）
+  一起生成。这样"详细 → 快速"也是 0.01 s。用**请求差集**而不是"224 kbps × 所有片段"，阶梯以后改也自动对齐。
+  这些额外条目只写缓存、不挂到题目上，计数单独报 `prewarmed`（否则用户会看到"22 题却新生成 23 段"）；
+  进度条的总量把预热量算进去（4.4 s / 23 个）。反方向（快速 → 详细）缺 17 个组合，是阶梯覆盖问题，
+  预热消不掉 —— 要消掉只能首次生成全集（§13 里权衡过，没做）。
 - **并发下的两个共享资源**（都出过或差点出问题）：
   1. `stimuli/index.json` 是「读 → 改 → 写」，必须在锁里**重新读一次**再合并写，
      否则后写的会覆盖别人刚登记的条目（文件在、索引丢 → 下次白重算）；
@@ -252,7 +259,8 @@ DELETE /api/library/{audio_id}            → 200 { deleted, freed_bytes } / 404
 DELETE /api/cache                         → 清空片段与测试音频缓存 data/cache { freed_bytes }
 
 POST /api/start                   body: { audio_ids, mode, progress_token? }
-                                  → { session_id, total, mode, stimuli: {generated, reused}, target_lufs }
+                                  → { session_id, total, mode, target_lufs,
+                                      stimuli: {generated, reused, prewarmed} }
 GET  /api/progress?token=                   → { found, phase, done, total, finished, error }（只读内存）
 GET  /api/question?session_id=&index=       → 仅 { index, total, question_id, url_a, url_b }
 POST /api/answer                  body: { session_id, question_id, choice, reaction_ms }
@@ -378,8 +386,10 @@ A/B 下面有**试听音量滑条**（−40 dB…0 dB，到底 = 静音；`↑/�
 19. **并发准备与串行结果一致**：并发数换成 1 / 4，缓存索引条目一个不少，解码后的样本逐样本一致。
 20. **准备进度可查**：`/api/start` 带 `progress_token` 时 `/api/progress` 能拿到 `phase/done/total`，
     完成后 `finished == true`；未知 token 返回 `{"found": false}`。
+21. **详细模式预热快速补集**：冷缓存跑详细 → 响应里 `prewarmed >= 1`；紧接着切快速 →
+    `generated == 0`（预热前这一步要补 1 对、约 0.7 s）。`PREWARM_SHORT_COMPLEMENT = False` 可关闭。
 
-自动化覆盖对照（`make test`，68 项）：#1 见 README 的安装/运行两行命令；#3/#4/#5 由 `test_api.py`
+自动化覆盖对照（`make test`，70 项）：#1 见 README 的安装/运行两行命令；#3/#4/#5 由 `test_api.py`
 的导入与拒绝用例覆盖；#6/#10/#11 由清理用例覆盖（含硬链接 inode 断言、"答完/结束后才能删除"的回归用例，
 以及 `test_clear_cache_only_touches_stimuli_cache`：**「清理测试音频缓存」只清 `data/cache`**，
 不碰 `data/tmp` / `data/session` / `data/library`）；
@@ -399,7 +409,8 @@ A/B 下面有**试听音量滑条**（−40 dB…0 dB，到底 = 静音；`↑/�
 `test_concurrent_stimuli_generation_is_identical_to_serial` / `test_concurrency_autodetect` /
 `test_shared_locks_survive_multiple_event_loops` 覆盖；
 #20 由 `test_progress_endpoint_reports_generation` / `test_progress_tracking_lifecycle` /
-`test_frontend_prepare_progress_is_wired` 覆盖。
+`test_frontend_prepare_progress_is_wired` 覆盖；#21 由 `test_detailed_round_prewarms_short_complement` /
+`test_prewarm_is_detailed_only_and_switchable` 覆盖。
 **只有 #2（浏览器实操）与 #7 的主观听感需要人来点一遍。**
 
 ## 10. 非目标（维护者红线）
@@ -432,7 +443,7 @@ README 的「它不做什么」是同一份清单的**用户口径**（只留用
 # 前置：系统已有 ffmpeg / ffprobe（实测 6.1.1）；本项目不 apt install、不装任何全局包
 make install     # = pip install -r requirements.txt（解释器自动探测，可用 PY= 覆盖）
 make run         # 前台启动（Ctrl+C 停止）；或 make run-bg 后台启动 + make stop 停止
-make test        # 68 项自动化测试（需要 make install-dev）
+make test        # 70 项自动化测试（需要 make install-dev）
 ```
 
 - **解释器**：`Makefile` 的 `PY` 会按「项目内 `.venv` → 作者的 conda 环境 `tin_ear` → `python3` → `python`」
@@ -479,10 +490,11 @@ make test        # 68 项自动化测试（需要 make install-dev）
 **缓存与性能**
 
 - 测试音频持久缓存 + session 硬链接：重复测试不再重算（原设计每轮重算约 130 MB 且测完即丢）。
-- **缓存"够用就好"，不做全集预生成**：题表按「模式 + 素材集合」确定，`audio_ids` 排序后再 round-robin，
-  所以同一模式重测 100% 复用；切模式时只补生成缺的那几档。另一种做法是首次就把两套阶梯的并集
-  （11 档 × 片段）全部生成好，之后任何模式都零等待，代价是快速模式首轮从 6 个变 22 个（磁盘 +5%）。
-  当前选择惰性生成 + 顺序无关，逻辑最省；真要"永远秒开"再加这一步也不冲突。
+- **缓存"够用就好"：按需生成 + 详细模式顺手补补集**。题表按「模式 + 素材集合」确定、`audio_ids` 排序后
+  round-robin，所以同一模式重测 100% 复用；切模式只补缺的那几档。**消掉"详细 → 快速"的 0.7 s** 用的是
+  极便宜的补集预热（`PREWARM_SHORT_COMPLEMENT`，+1～2 对 ≈ 11 MB/首）；**消掉"快速 → 详细"的 17 个缺口**
+  则只能首次生成全集（11 档 × 片段，快速模式首轮从 6 个变 22 个、磁盘 +约 190 MB/首）——
+  对"只用快速模式的人"代价太大，所以不做。
 - **生成按 CPU 核数并发**（`min(核数, 8)`，实测 22 题 15.3 s → 3.9 s）：单题 0.70 s 里 0.46 s 是
   我们自己的响度+对齐计算、0.25 s 是 ffmpeg 编解码，两者都能并行；8 路之后收益迅速变小（12 路 3.5 s），
   所以封顶 8。并发带来的共享资源（`index.json` 读改写、同一素材的片段生成）各自加了锁。
@@ -532,7 +544,10 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
   会比较缓存索引条目数与**解码后的样本**；注意不能比文件字节 —— libsndfile 的 `PEAK` chunk 带时间戳）、
   **进度状态机与过期清理**（`test_progress_tracking_lifecycle` / `test_concurrency_autodetect`）、
   **共享锁的循环作用域**（`test_shared_locks_survive_multiple_event_loops`：两个 `asyncio.run` 循环里
-  各争用一次同一把锁 —— 这正是 `_loop_scoped_lock` 要防的坑）。
+  各争用一次同一把锁 —— 这正是 `_loop_scoped_lock` 要防的坑）、
+  **详细模式预热快速补集**（`test_detailed_round_prewarms_short_complement` /
+  `test_prewarm_is_detailed_only_and_switchable`：冷缓存 detailed 报告 `prewarmed >= 1`，
+  接着 short 必须 `generated == 0`；关掉开关后 short 又需要补 1 个）。
 - `tests/test_api.py`：导入与去重（含带封面源的导入）、有损格式拒绝、删除与 409（含"答完全部题目后即可删除"的回归）、
   题目参数校验、**防泄漏**、`reveal` 只在作答后返回且只含本题、首答即最终与幂等重放、安慰剂两路内容相同、
   带封面源的端到端出题回归、结果统计（p 值/显著/样本不足/`status` 枚举）与结论文案、
@@ -568,7 +583,8 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 | 带内嵌封面的源（复现 rc=234） | 未加 `-map 0:a:0` 时 `ffmpeg` 返回 rc=234 + `Attached pictures were requested, but the ID3v2 header is disabled`；加上后三步全部 rc=0 |
 | 统计口径实测 | `POWER_REQUIRED_N = 7`；20/20 的精确 p = 2.9e-10（`p<0.001`）；22 题一轮的安慰剂位置实测出现过 [0, 17]（即被正确打散） |
 | 随机 token 的"包含码率数字"概率 | 16 位 hex、15 个两位窗口 → 含某个指定的两位数概率 **5.74%**（实测 20000 次采样）；这就是那条防泄漏断言原来的假阳性率，已在测试里固定随机源修掉 |
-| 并发冷启动端到端（真 uvicorn + HTTP，1 首 65 s 素材、detailed） | `generated: 22, reused: 0` 用时 **4.0 s**（进度 0→22 正常上报）；同素材第二轮 `generated: 0, reused: 22`；详细→快速补生成 **1** 个（224 kbps 只属快速阶梯）、快速→详细 `0 / 22`；缓存 245.5 MB/首 |
+| 并发冷启动端到端（真 uvicorn + HTTP，1 首 65 s 素材、detailed；**预热功能之前**的实测） | `generated: 22, reused: 0` 用时 **4.0 s**（进度 0→22 正常上报）；同素材第二轮 `generated: 0, reused: 22`；详细→快速补生成 **1** 个（224 kbps 只属快速阶梯）、快速→详细 `0 / 22`；缓存 245.5 MB/首 |
+| 详细模式预热快速补集（同上素材，冷缓存） | detailed：`generated: 22, reused: 0, prewarmed: 1`，用时 **4.4 s**（进度总量 23）；紧接着 short：`generated: 0, reused: 6`，用时 **0.009 s**（预热前这一步是 0.7 s） |
 | 依赖 | 全部 wheel（soundfile 自带 libsndfile），无需编译器或系统库 |
 
 > 另有一个**不是 bug 的坑**：比较测试音频的**文件字节**永远不可能相等 —— libsndfile 写 WAV 时会加一个
@@ -595,13 +611,13 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 
 ## 16. 项目现状（交接摘要）
 
-- **状态**：功能完整可用。`make test` **68 项**全绿（约 1 分钟）。
+- **状态**：功能完整可用。`make test` **70 项**全绿（约 1 分钟）。
 - **改动历史**：看 `git log --oneline`（最近一次：缓存顺序无关 + 并发生成 + 进度条 + 术语改「测试音频」
   + 环境配置与文档收敛）。历史上修过的真问题都在 §15，不必从提交信息里考古。
 - **关键实测**：每对 ΔLUFS = 0.0000 LU、真峰值 ≈ −5.3 dBTP（−18 LUFS 下）、两路各 5760088 字节（无体积泄漏）、
-  22 题详细模式**串行 15.8 s / 8 路并发 3.9 s**、缓存复用 0.01 s、测试音频缓存 245.8 MB/首、`POWER_REQUIRED_N = 7`。
-  完整表见 §15。
-- **待人工验证**：验收 #2（浏览器实操，含新的进度条）与 #7 的主观听感；其余 18 条已自动化（对照表见 §9）。
+  22 题详细模式**串行 15.8 s / 8 路并发 3.9 s**、缓存复用 0.01 s、测试音频缓存 245.8 MB/首、
+  详细模式顺手预热后**两个方向切换都是 0.01 s**、`POWER_REQUIRED_N = 7`。完整表见 §15。
+- **待人工验证**：验收 #2（浏览器实操，含新的进度条）与 #7 的主观听感；其余 20 条已自动化（对照表见 §9）。
 - **已定位并修掉的测试假阳性**：`test_question_does_not_leak_bitrate_or_codec` 曾约每十轮挂一次，
   现象是 `assert '96' not in '47398a8e90e79657'`。根因**不在产品代码**：不透明 token 是随机 16 位 hex，
   15 个两位窗口里出现 `96` 的概率实测 **5.74%**，而那条断言把"token 恰好含码率数字"误判成泄漏
@@ -610,7 +626,8 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
   > 教训：拿"包含某子串"当安全断言，遇到随机串必然偶发假阳性；要么固定随机源，要么改判结构性质。
 - **可一行调整的行为**（都在 `app.py` 顶部）：`TARGET_LUFS`（改完要 bump `STIMULI_ALGO_VERSION`）、
   `SHORT_TEST_TOTAL` / `DETAILED_TEST_TOTAL` 与两条码率阶梯、`SHUFFLE_ALL_QUESTIONS`、
-  `PLACEBO_SAME_SEGMENT`、`SEG_WEIGHTS`、`CHANCE_LEVEL` / `ALPHA` / `MIN_N_FOR_SIGNIFICANCE`、
+  `PLACEBO_SAME_SEGMENT`、`PREWARM_SHORT_COMPLEMENT`、`SEG_WEIGHTS`、
+  `CHANCE_LEVEL` / `ALPHA` / `MIN_N_FOR_SIGNIFICANCE`、
   `STIMULI_CONCURRENCY_MAX`（并发上限；运行时可用 `TINEAR_CONCURRENCY=4` 覆盖）；
   前端是否自动揭晓答案在 `static/app.js` 的 `renderConfirmation()`（默认只显示"已记录"，答案需手动点）；
   试听音量范围/步长在 `static/index.html` 的 `#volume-input` 与 `app.js` 的 `VOLUME_*` 常量。

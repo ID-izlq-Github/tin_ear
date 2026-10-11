@@ -140,6 +140,9 @@ LAME_EXTRA_ARGS = [
 ]
 SHUFFLE_ALL_QUESTIONS = True  # 真实题与安慰剂题统一打乱位置，避免用「第几题」预判
 PLACEBO_SAME_SEGMENT = True  # 默认：安慰剂 = 同一片段的两份无损拷贝
+PREWARM_SHORT_COMPLEMENT = True  # 详细模式顺手生成"快速模式才需要的那几对"（快速 → 详细仍需补 17 个：
+#                                  详细是 10 档 × 2 片段，快速只覆盖其中 5 个组合，这部分无法靠预热消除）。
+#                                  代价：每首多 1～2 对（约 11 MB），换来"详细 → 快速"也 0.01 s。
 RESULT_BRACKETS = [(0, 96, "≤96 kbps"), (128, 192, "128–192 kbps"), (224, 10**9, "≥224 kbps")]
 
 # 统计口径（AGENTS.md §4.1）
@@ -919,6 +922,19 @@ class Question:
     alt_seg: int | None = None
 
 
+# 一次测试音频请求 = 缓存键 = (音频, 片段, 码率)；安慰剂题的 bitrate 为 None
+StimulusKey = tuple[str, int, int | None, int | None]
+
+
+def _stimulus_key_of(question: Question) -> StimulusKey:
+    return (question.audio_id, question.seg_index, question.bitrate, question.alt_seg)
+
+
+def _unique_requests(keys: list[StimulusKey]) -> list[StimulusKey]:
+    """去重且保持顺序（同一条测试音频在一轮里只该生成一次）。"""
+    return list(dict.fromkeys(keys))
+
+
 @dataclass
 class SessionState:
     session_id: str
@@ -1064,30 +1080,42 @@ def _progress_purge() -> None:
             PROGRESS.pop(token, None)
 
 
-async def _prepare_session(questions: list[Question], progress_token: str | None = None) -> dict:
-    """为每道题准备测试音频（命中缓存则复用），返回本次新生成/复用的数量。
+async def _prepare_session(
+    questions: list[Question],
+    progress_token: str | None = None,
+    prewarm: list["StimulusKey"] | None = None,
+) -> dict:
+    """为每道题准备测试音频（命中缓存则复用），返回本次新生成/复用/预热的数量。
 
     并发执行：单题约 0.70 s（响度+对齐 0.46 s、ffmpeg 编解码 0.25 s），逐题串行时
     22 题要 15 s 以上；按核数并发（默认封顶 8）实测 3.9 s。
     `STIMULI_CONCURRENCY` 同时决定任务槽位与 ffmpeg 子进程槽位。
-    """
-    total = len(questions)
-    semaphore = asyncio.Semaphore(STIMULI_CONCURRENCY)
-    entries: dict[int, dict] = {}
-    counters = {"generated": 0, "reused": 0, "done": 0}
 
-    async def prepare_one(position: int, question: Question) -> None:
+    `prewarm` 是额外的请求（本轮题目用不到，但下次换模式会用到，见 `PREWARM_SHORT_COMPLEMENT`）：
+    它们只生成缓存、不挂到题目上，计数单独报在 `prewarmed` 里，免得用户看到"22 题却新生成 23 段"。
+    """
+    requests = _unique_requests([_stimulus_key_of(q) for q in questions])
+    question_keys = set(requests)
+    extra = [key for key in _unique_requests(prewarm or []) if key not in question_keys]
+    total = len(requests) + len(extra)
+    semaphore = asyncio.Semaphore(STIMULI_CONCURRENCY)
+    entries: dict[StimulusKey, dict] = {}
+    counters = {"generated": 0, "reused": 0, "prewarmed": 0, "done": 0}
+
+    async def prepare_one(key: StimulusKey) -> None:
+        audio_id, seg_index, bitrate, alt_seg = key
         async with semaphore:
-            entry, from_cache = await _ensure_stimuli(
-                question.audio_id, question.seg_index, question.bitrate, question.alt_seg
-            )
-        entries[position] = entry
-        counters["reused" if from_cache else "generated"] += 1
+            entry, from_cache = await _ensure_stimuli(audio_id, seg_index, bitrate, alt_seg)
+        entries[key] = entry
+        if key in question_keys:
+            counters["reused" if from_cache else "generated"] += 1
+        elif not from_cache:
+            counters["prewarmed"] += 1
         counters["done"] += 1
         # 单事件循环里读改写之间没有 await，计数不会互相覆盖
         _progress_update(progress_token, done=counters["done"], total=total, phase="stimuli")
 
-    tasks = [asyncio.create_task(prepare_one(i, q)) for i, q in enumerate(questions)]
+    tasks = [asyncio.create_task(prepare_one(key)) for key in requests + extra]
     try:
         await asyncio.gather(*tasks)
     except BaseException:
@@ -1097,9 +1125,13 @@ async def _prepare_session(questions: list[Question], progress_token: str | None
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
 
-    for position, question in enumerate(questions):
-        question.stimulus = entries[position]
-    return {"generated": counters["generated"], "reused": counters["reused"]}
+    for question in questions:
+        question.stimulus = entries[_stimulus_key_of(question)]
+    return {
+        "generated": counters["generated"],
+        "reused": counters["reused"],
+        "prewarmed": counters["prewarmed"],
+    }
 
 
 def _reveal(question: Question) -> dict:
@@ -1500,9 +1532,21 @@ async def api_start(request: StartRequest) -> dict:
         _progress_update(progress_token, done=position + 1)
 
     questions = _build_questions(request.mode, audio_ids, segment_indices)
-    _progress_update(progress_token, phase="stimuli", done=0, total=len(questions))
+    prewarm: list[StimulusKey] = []
+    if request.mode == "detailed" and PREWARM_SHORT_COMPLEMENT:
+        # 详细模式顺手把"快速模式才用到的那几对"也生成掉，下次切快速就是 0.01 s。
+        # 这里用 _build_questions 算出快速模式实际会请求哪些组合（而不是"224 kbps × 所有片段"），
+        # 阶梯以后怎么改都自动对齐；两套阶梯的差集通常只有 1～2 对。
+        short_requests = _unique_requests(
+            [_stimulus_key_of(q) for q in _build_questions("short", audio_ids, segment_indices)]
+        )
+        detailed_keys = set(_stimulus_key_of(q) for q in questions)
+        prewarm = [key for key in short_requests if key not in detailed_keys]
+    _progress_update(
+        progress_token, phase="stimuli", done=0, total=len(questions) + len(prewarm)
+    )
     try:
-        stimuli = await _prepare_session(questions, progress_token)
+        stimuli = await _prepare_session(questions, progress_token, prewarm)
     except AudioToolError as exc:
         detail = f"生成测试音频失败：{exc}"
         _progress_finish(progress_token, error=detail)

@@ -597,9 +597,13 @@ async function startTest() {
     state.mode = data.mode;
     state.bufferCache.clear();
     const stimuli = data.stimuli;
+    // 详细模式会顺手预热"快速模式才用到的那几对"，如实报出来（不是本轮题目，但占了一点时间）
+    const prewarmed = stimuli && stimuli.prewarmed
+      ? `（顺手预热 ${stimuli.prewarmed} 段，下次切快速模式同样秒开）`
+      : '';
     setStatus(
       'prepare-status',
-      stimuli ? `测试音频就绪：新生成 ${stimuli.generated} 段，复用 ${stimuli.reused} 段。` : '',
+      stimuli ? `测试音频就绪：新生成 ${stimuli.generated} 段，复用 ${stimuli.reused} 段。${prewarmed}` : '',
       'ok'
     );
     // 让用户知道文件本身已经归一到多少 LUFS（这样"要不要调滑条"心里有数）
