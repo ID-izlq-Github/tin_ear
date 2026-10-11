@@ -113,13 +113,122 @@ function buildTable(table, headers, rows) {
     const tr = document.createElement('tr');
     row.forEach((value, index) => {
       const td = document.createElement('td');
-      td.textContent = String(value);
       if (index > 0) td.className = 'num';
+      if (value !== null && typeof value === 'object') {
+        // {badge: {kind, label}, text, sub} —— 判定列用徽章 + 一行小字
+        if (value.badge) {
+          const badge = document.createElement('span');
+          badge.className = 'badge ' + value.badge.kind;
+          badge.textContent = value.badge.label;
+          td.appendChild(badge);
+        } else if (value.text !== undefined) {
+          td.textContent = String(value.text);
+        }
+        if (value.sub) {
+          const sub = document.createElement('div');
+          sub.className = 'sub';
+          sub.textContent = value.sub;
+          td.appendChild(sub);
+        }
+      } else {
+        td.textContent = String(value === null || value === undefined ? '—' : value);
+      }
       tr.appendChild(td);
     });
     tbody.appendChild(tr);
   });
   table.append(thead, tbody);
+}
+
+/* 统计判定 → 视觉分级（与后端 _row_stats 的 status 枚举一一对应） */
+const STATUS_INFO = {
+  significant: { kind: 'ok', label: '显著高于 1/3' },
+  not_significant: { kind: 'muted', label: '无显著差异' },
+  insufficient: { kind: 'warn', label: '样本不足' },
+};
+
+function statusOf(row) {
+  return STATUS_INFO[(row && row.status) || 'insufficient'] || STATUS_INFO.insufficient;
+}
+
+function verdictCell(row) {
+  const cell = { badge: statusOf(row) };
+  if (row.n >= 3 && row.p_value !== null && row.p_value !== undefined) cell.sub = `p = ${pText(row)}`;
+  return cell;
+}
+
+/* 结论卡：总体数字 + 分档徽章 + 安慰剂提示 + 样本量提示 */
+function renderSummary(result) {
+  const card = $('summary-card');
+  const overall = result.overall || { n: 0, correct: 0, status: 'insufficient' };
+  card.textContent = '';
+
+  const head = document.createElement('div');
+  head.className = 'summary-head';
+  const big = document.createElement('span');
+  big.className = 'summary-num';
+  big.textContent = overall.n ? `${overall.correct}/${overall.n}` : '—';
+  const rate = document.createElement('span');
+  rate.className = 'summary-rate';
+  rate.textContent = overall.accuracy === null || overall.accuracy === undefined
+    ? ''
+    : pct(overall.accuracy);
+  const badge = document.createElement('span');
+  const info = statusOf(overall);
+  badge.className = 'badge ' + info.kind;
+  badge.textContent = info.label;
+  head.append(big, rate, badge);
+  card.appendChild(head);
+
+  const sub = document.createElement('div');
+  sub.className = 'summary-sub';
+  const bits = ['真实题总体'];
+  if (overall.n && overall.n < 3) bits.push(`只有 ${overall.n} 题，任何结果都无法判定`);
+  else if (overall.p_value !== null && overall.p_value !== undefined) bits.push(`p = ${pText(overall)}`);
+  sub.textContent = bits.join(' · ');
+  card.appendChild(sub);
+
+  if (result.by_bracket && result.by_bracket.length) {
+    const chips = document.createElement('div');
+    chips.className = 'chips';
+    for (const row of result.by_bracket) {
+      const chip = document.createElement('div');
+      chip.className = 'chip';
+      const name = document.createElement('b');
+      name.textContent = row.label;
+      const count = document.createElement('span');
+      count.className = 'chip-count';
+      count.textContent = `${row.correct}/${row.n}`;
+      const chipBadge = document.createElement('span');
+      const chipInfo = statusOf(row);
+      chipBadge.className = 'badge ' + chipInfo.kind;
+      chipBadge.textContent = chipInfo.label;
+      chip.append(name, count, chipBadge);
+      chips.appendChild(chip);
+    }
+    card.appendChild(chips);
+  }
+
+  const placebo = result.placebo || { n: 0 };
+  const placeboLine = document.createElement('div');
+  placeboLine.className = 'summary-line' + (placebo.warning ? ' warn' : '');
+  placeboLine.textContent = placebo.n
+    ? `安慰剂题：${placebo.n} 题中 ${placebo.tie} 题选了「听不出」（${pct(placebo.tie_rate)}）。`
+      + (placebo.warning
+        ? '你在两路完全相同的情况下仍然"听出"了更好的一边 —— 前面的正确率要打折看。'
+        : '这是好事：说明你基本不会凭空听出差异。')
+    : '本次没有作答安慰剂题。';
+  card.appendChild(placeboLine);
+
+  const power = result.power || {};
+  if (power.required_n) {
+    const powerLine = document.createElement('div');
+    powerLine.className = 'summary-line muted';
+    powerLine.textContent = `样本量：每个码率最多 ${power.max_per_bitrate || 0} 题；`
+      + `要让每档都达到 ${Math.round((power.target_power || 0.8) * 100)}% 检验功效`
+      + `（假定真听出率 ${power.assumed_rate || 0.8}），约需每档 ${power.required_n} 题。`;
+    card.appendChild(powerLine);
+  }
 }
 
 /* -------------------------------------------------------- Web Audio 播放 */
@@ -503,35 +612,41 @@ function renderConfirmation() {
   setStatus('answer-status', '');
 }
 
-/* 可选：查看答案。默认不自动揭晓，避免对后续题产生反馈偏置。 */
+/* 可选：查看答案。默认不自动揭晓，避免对后续题产生反馈偏置。
+   注意：这里任何情况下都要显示点东西 —— 之前旧脚本读不到新接口字段时抛异常，
+   结果只把按钮藏起来了，页面上什么都没出现（很难排查）。 */
 function revealAnswer() {
   const answer = state.lastAnswer;
   if (!answer) return;
-  const reveal = answer.reveal;
   $('btn-reveal').classList.add('hidden');
-  if (!reveal) {
-    $('reveal-line').textContent = '本题已按首次作答计分，不再显示答案。';
-    $('reveal-line').classList.remove('hidden');
+  const line = $('reveal-line');
+  const show = (text, kind = '') => {
+    line.textContent = text;
+    line.className = 'reveal' + (kind ? ' ' + kind : '');
+    line.classList.remove('hidden');
+  };
+
+  const reveal = answer.reveal;
+  if (!reveal || !reveal.sides || !reveal.sides.a || !reveal.sides.b) {
+    show('没能取到本题的答案信息（通常是浏览器还缓存着旧版脚本）：请按 Ctrl+Shift+R 强制刷新后重试。', 'warn');
     return;
   }
+
   const sideLabel = (side) => (reveal.sides[side].kind === 'lossless'
     ? '无损'
     : `MP3 ${reveal.sides[side].bitrate} kbps`);
-  let text;
   if (reveal.placebo) {
     const same = reveal.same_segment ? '同一片段的两份拷贝' : '两个片段，都是无损';
     const verdict = answer.choice === 'tie' ? '✔ 你选了「听不出」' : '✘ 你在没有差异的两路之间"听出了"更好的一边';
-    text = `A：无损 / B：无损（${same}）—— 这是安慰剂题，正确答案是「听不出」。${verdict}`;
-  } else {
-    const correct = answer.choice === reveal.correct_side;
-    const verdict = correct
-      ? '✔ 你选对了'
-      : (answer.choice === 'tie' ? '✘ 这一题其实能听出来' : '✘ 你选错了');
-    text = `A：${sideLabel('a')} / B：${sideLabel('b')} —— 无损在 ${reveal.correct_side.toUpperCase()}`
-      + `（正确答案：${CHOICE_LABELS[reveal.correct_side]}）。${verdict}`;
+    show(`A：无损 / B：无损（${same}）—— 这是安慰剂题，正确答案是「听不出」。${verdict}`);
+    return;
   }
-  $('reveal-line').textContent = text;
-  $('reveal-line').classList.remove('hidden');
+  const correct = answer.choice === reveal.correct_side;
+  const verdict = correct
+    ? '✔ 你选对了'
+    : (answer.choice === 'tie' ? '✘ 这一题其实能听出来' : '✘ 你选错了');
+  show(`A：${sideLabel('a')} / B：${sideLabel('b')} —— 无损在 ${reveal.correct_side.toUpperCase()}`
+    + `（正确答案：${CHOICE_LABELS[reveal.correct_side]}）。${verdict}`);
 }
 
 async function advance() {
@@ -554,52 +669,43 @@ async function advance() {
 async function showResult() {
   stopPlayback(true);
   const result = await api(`/api/result?session_id=${encodeURIComponent(state.sessionId)}`);
-  $('conclusion').textContent = result.conclusion;
 
-  const bracketRows = [];
-  if (result.overall && result.overall.n) {
-    bracketRows.push(['全部真实题', result.overall.n, result.overall.correct,
-      pct(result.overall.accuracy), ciText(result.overall), pText(result.overall), result.overall.note]);
-  }
-  for (const row of result.by_bracket) {
-    bracketRows.push([row.label, row.n, row.correct, pct(row.accuracy), ciText(row), pText(row), row.note]);
-  }
+  renderSummary(result);
+
   buildTable(
     $('bracket-table'),
-    ['码率区间', '题数', '答对', '正确率', '95% 置信区间', 'p 值', '判定'],
-    bracketRows
+    ['码率区间', '题数', '答对', '正确率', '95% 区间', '判定'],
+    (result.by_bracket || []).map((row) => [
+      row.label, row.n, row.correct, pct(row.accuracy), ciText(row), verdictCell(row),
+    ])
   );
   buildTable(
     $('bitrate-table'),
-    ['码率 (kbps)', '题数', '答对', '正确率', '95% 置信区间', 'p 值', '平均反应', '判定'],
-    result.by_bitrate.map((row) => [
+    ['码率 (kbps)', '题数', '答对', '正确率', '95% 区间', '判定', '平均反应'],
+    (result.by_bitrate || []).map((row) => [
       row.bitrate,
       row.n,
       row.correct,
       pct(row.accuracy),
       ciText(row),
-      pText(row),
+      verdictCell(row),
       row.mean_reaction_ms ? `${(row.mean_reaction_ms / 1000).toFixed(1)} s` : '—',
-      row.note,
     ])
   );
 
   const chance = result.chance_level !== undefined
     ? `${Math.round(result.chance_level * 100)}%`
     : '33%';
-  const needed = result.power_required_n || 7;
+  const needed = (result.power && result.power.required_n) || result.power_required_n || 7;
   $('stats-note').textContent = [
-    `统计口径：三选一（A / B / 听不出）的瞎猜基线是 ${chance}，不是 50%；`,
-    `p 值是单侧精确二项检验（H0：正确率 = 瞎猜基线），p < ${result.alpha || 0.05} 才判「显著高于瞎猜」。`,
-    `每档少于 3 题时任何结果都无法判定 —— 逐档表只作参考，结论看「全部真实题」与分档行。`,
-    `要让每档达到 80% 检验功效（假定真听出率 0.8），约需每档 ${needed} 题；`,
+    `瞎猜基线是 ${chance}，不是 50%：三个选项里只有一个是"无损那侧"，闭着眼睛乱选也有约 ${chance} 的正确率。`,
+    `判定用单侧精确二项检验（H0：正确率 = 瞎猜基线），p < ${result.alpha || 0.05} 才算显著高于瞎猜。`,
+    '不足 3 题的行一律标「样本不足」—— n=1 时最小的 p 就是 1/3，结构上不可能显著。',
+    '「95% 区间」是 Wilson 区间，只作描述性参考，样本小时会非常宽。',
+    `要让每档都达到 80% 检验功效（假定真听出率 0.8），约需每档 ${needed} 题。`,
     '想要更硬的结论，就把 app.py 顶部的 DETAILED_TEST_TOTAL / SHORT_TEST_TOTAL 调大（码率阶梯会自动循环）。',
   ].join('\n');
-
-  const placebo = result.placebo;
-  $('placebo-line').textContent = placebo.n
-    ? `安慰剂题（混在题目中，A、B 均为无损）：共 ${placebo.n} 题，其中 ${placebo.tie} 题选了「听不出」（${pct(placebo.tie_rate)}）。若这一比例偏低，说明倾向于听到并不存在的差异。`
-    : '本次没有安慰剂题。';
+  $('conclusion-text').textContent = result.conclusion || '';
 
   showView('result');
 }

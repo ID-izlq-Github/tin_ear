@@ -438,6 +438,7 @@ def test_result_counts_correct_answers(client, monkeypatch, long_source):
         "ci_high": 1.0,
         "p_value": pytest.approx(0.0041, abs=1e-4),
         "significant": True,
+        "status": "significant",
         "note": "显著高于瞎猜基线",
     }
     assert result["by_bitrate"] == [{"bitrate": 96, **expected, "mean_reaction_ms": 1200}]
@@ -447,7 +448,13 @@ def test_result_counts_correct_answers(client, monkeypatch, long_source):
     assert result["chance_level"] == pytest.approx(1 / 3, abs=1e-4)
     assert result["alpha"] == 0.05
     assert result["power_required_n"] == 7
-    assert result["placebo"] == {"n": 1, "tie": 1, "tie_rate": 1.0}
+    assert result["power"] == {
+        "required_n": 7,
+        "max_per_bitrate": 5,
+        "target_power": 0.8,
+        "assumed_rate": 0.8,
+    }
+    assert result["placebo"] == {"n": 1, "tie": 1, "tie_rate": 1.0, "warning": False}
     assert "显著高于瞎猜基线" in result["conclusion"]
     assert "瞎猜倾向" not in result["conclusion"]
     assert "每档 7 题" in result["conclusion"]
@@ -467,7 +474,9 @@ def test_result_flags_guessing(client, monkeypatch, long_source):
     result = client.get("/api/result", params={"session_id": session_id}).json()
     assert result["real_correct"] == 0
     assert result["overall"]["significant"] is False
+    assert result["overall"]["status"] == "not_significant"
     assert result["placebo"]["tie_rate"] == 0.0
+    assert result["placebo"]["warning"] is True
     assert "与瞎猜基线无显著差异" in result["conclusion"]
     assert "瞎猜倾向" in result["conclusion"]
 
@@ -481,7 +490,9 @@ def test_result_statistics_payload(client, monkeypatch, long_source):
 
     empty = client.get("/api/result", params={"session_id": session_id}).json()
     assert empty["overall"]["n"] == 0 and empty["overall"]["p_value"] is None
+    assert empty["overall"]["status"] == "insufficient"
     assert empty["by_bitrate"] == [] and empty["placebo"]["n"] == 0
+    assert empty["power"]["max_per_bitrate"] == 0
     assert empty["conclusion"]
 
     # 只答一道（真实题）→ 逐档 n=1，任何结果都不可能显著（p = 1/3）
@@ -491,8 +502,34 @@ def test_result_statistics_payload(client, monkeypatch, long_source):
     assert one["by_bitrate"][0]["n"] == 1
     assert one["by_bitrate"][0]["p_value"] == pytest.approx(1 / 3, abs=1e-4)
     assert one["by_bitrate"][0]["significant"] is False
+    assert one["by_bitrate"][0]["status"] == "insufficient"
+    assert one["power"]["max_per_bitrate"] == 1
     assert "样本不足" in one["by_bitrate"][0]["note"]
     assert "样本不足" in one["conclusion"]
+
+
+def test_static_assets_are_revalidated(client):
+    """HTML/JS/CSS 必须要求浏览器重验证。
+
+    回归：浏览器用缓存里的旧 app.js 调新接口时，旧脚本读不到新字段就抛异常，
+    "查看答案"只把按钮藏了、什么都不显示（很难排查）。带 ?v= 的 URL + no-cache 双重兜底。
+    """
+    index = client.get("/")
+    assert index.status_code == 200
+    assert "no-cache" in index.headers.get("cache-control", "")
+
+    script = client.get("/static/app.js")
+    assert script.status_code == 200
+    assert "no-cache" in script.headers.get("cache-control", "")
+
+    # 页面里引用静态资源时带版本号，改前端后只需 bump 版本即可绕开任何中间缓存
+    assert "/static/app.js?v=" in index.text
+    assert "/static/style.css?v=" in index.text
+
+    # 前端不再依赖旧的顶层 correct_side / correctSide 字段（揭晓改成 reveal 之前的契约）
+    assert "data.correct_side" not in script.text
+    assert "correctSide" not in script.text
+    assert "reveal.sides" in script.text
 
 
 def test_result_handles_unanswered_questions(client, fast_config, long_source):

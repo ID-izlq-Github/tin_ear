@@ -258,10 +258,15 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
   答完全部题目或 `/api/end` 之后即可删除。
 - 判定：真实题选中无损侧为正确，选 `tie` 记为"未听出"（不正确）；安慰剂题选 `tie` 才是正确。
 - 结果统计：两层都用**单侧精确二项检验**（H0 = `CHANCE_LEVEL` = 1/3，`alpha` = 0.05），Wilson 区间降级为
-  描述性；每行给 `p_value / significant / note`，顶层给 `overall`（全部真实题）、`chance_level`、`alpha`、
-  `power_required_n`（当前口径下 = 7）。`note` 三态：`样本不足（n<3，无法判定）` / `显著高于瞎猜基线` /
+  描述性；每行给 `p_value / significant / status / note`（`status ∈ {significant, not_significant, insufficient}`，
+  是给前端做视觉分级的稳定枚举），顶层给 `overall`（全部真实题）、`by_bitrate`、`by_bracket`、
+  `chance_level`、`alpha`、`power_required_n`（= 7）、`power: {required_n, max_per_bitrate, target_power, assumed_rate}`
+  与 `placebo: {n, tie, tie_rate, warning}`。`note` 三态：`样本不足（n<3，无法判定）` / `显著高于瞎猜基线` /
   `与瞎猜基线无显著差异`。`n < MIN_N_FOR_SIGNIFICANCE` 时 `significant` 恒为 false
-  （n=1 的最小 p 就是 1/3，结构上不可能显著）。
+  （n=1 的最小 p 就是 1/3，结构上不可能显著）。`conclusion` 是同一套信息的纯文本版本（测试与复制用）。
+- **静态资源强制重验证**：中间件给 `/` 与 `/static/*` 加 `Cache-Control: no-cache, must-revalidate`
+  （命中 ETag 时是 304），并且 `index.html` 用 `/static/app.js?v=N` 引用资源。原因见 §15 的第 5 条：
+  浏览器拿旧 app.js 调新接口会**静默失败**。改前端后记得 bump `?v=`。
 - `/api/start` 会校验：`mode ∈ {short, detailed}`、`audio_ids` 去重后 1～3 个且都存在；参数不合法 400，音频不存在 404。
 
 ## 8. 前端
@@ -279,15 +284,19 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 「查看答案」（**可选**手动揭晓，默认不自动揭晓以免对后续题产生反馈偏置）与「下一题 →」（末题为「查看结果 →」）。
 点「查看答案」会显示**两侧的具体身份**，例如 `A：无损 / B：MP3 96 kbps —— 无损在 B（正确答案：B 更好）。✘ 你选错了`；
 安慰剂题显示 `A：无损 / B：无损（同一片段的两份拷贝）—— 安慰剂题，正确答案是「听不出」`。
+这个函数**任何情况下都必须显示点东西**：拿不到 `reveal`（例如浏览器还在用旧脚本）时显示
+「没能取到本题的答案信息……请按 Ctrl+Shift+R 强制刷新后重试」，绝不静默（见 §15 第 5 条）。
 若出现同一题改选项的请求（正常 UI 不会发生），提示"本题已作答（首答即最终），本次修改已忽略"。
 音频未载入完不允许作答，保证 `reaction_ms` 有效。
 键盘：`1/2/3` 作答、`A/B/空格` 切换试听、回车或空格进入下一题。
 离开测试页、点「再测一次」、或关闭标签页（`sendBeacon`）时都会调用 `/api/end`，不会留下"进行中"的引用。
 
-**结果**：分档表（首行「全部真实题」= `overall`）列为 `题数 / 答对 / 正确率 / 95% 置信区间 / p 值 / 判定`，
-逐档明细表同列 + 平均反应；下面是安慰剂"听不出"比例与文字结论。另有一段统计口径说明：
-**瞎猜基线是 1/3（不是 50%）**、p 是单侧精确二项检验、每档 < 3 题无法判定、达到 80% 功效约需每档
-`power_required_n` 题。再测一次 / 返回库。
+**结果**：顶上一张**结论卡**（DOM 拼装，不用 innerHTML）—— 大字总体 `4/5 · 80%` + 状态徽章、
+三个分档 chip（`≤96 kbps 2/2 · 样本不足`）、安慰剂题提示（`warning` 时变黄色）、样本量提示。
+下面两张表：`码率区间 | 题数 | 答对 | 正确率 | 95% 区间 | 判定`（逐档表多一列"平均反应"），
+「判定」列是彩色徽章（`显著高于 1/3` / `无显著差异` / `样本不足`），n≥3 时徽章下再附一行 `p = …`；
+总体数字只出现在结论卡里，不再在表里重复一行。整段文字说明收进 `<details>`「统计口径与样本量说明」
+（含纯文本 `conclusion` 便于复制），默认收起。表格外层 `.table-wrap` 可横向滚动，窄屏不挤成一团。
 
 深色背景，大按钮，移动端可用，不做花哨动效。
 
@@ -303,15 +312,17 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 7. 每题 A/B 响度差 ≤ 0.3 LU。
 8. **作答之前**的任何前端请求都看不到码率 / 编码器 / 文件名 / 是否安慰剂；作答之后 `/api/answer`
    才揭晓**本题**两侧的具体身份（无损 / MP3 xx kbps）。
-9. 结果页正确率、安慰剂统计、p 值与"样本不足"判定正确。
+9. 结果页正确率、安慰剂统计、p 值与"样本不足"判定正确；每个统计行都带 `status` 枚举供前端上色。
 10. 后端重启清空 `data/session/`，保留 `data/library/`。
 11. `/api/end` 后 session 目录被删。
 12. 改 `SEGMENT_ALGO_VERSION` 后 cache 失效重算。
 13. 带内嵌封面的源可以正常导入并完成出题（不再 rc=234）。
 14. 首答即最终：改了选项不改分、不揭晓答案；同选项重复提交幂等。
 15. 出题顺序每轮随机（含安慰剂），而每轮用到的刺激集合完全一致（缓存必然复用）。
+16. `/` 与 `/static/*` 返回 `Cache-Control: no-cache, must-revalidate`，页面用 `?v=N` 引用 JS/CSS ——
+    浏览器不会拿旧脚本去调新接口（见 §15 第 5 条）。
 
-自动化覆盖对照（`make test`，58 项）：#1 见 README 的安装/运行两行命令；#3/#4/#5 由 `test_api.py`
+自动化覆盖对照（`make test`，59 项）：#1 见 README 的安装/运行两行命令；#3/#4/#5 由 `test_api.py`
 的导入与拒绝用例覆盖；#6/#10/#11 由清理用例覆盖（含硬链接 inode 断言，以及"答完/结束后才能删除"的回归用例）；
 #7 的实测值为 `ΔLUFS = 0.0000`（远严于 0.3，`test_prepare_pair_loudness_and_peak` 断言 ≤ 0.05）；#8 由
 `test_question_does_not_leak_bitrate_or_codec` 覆盖（键集合白名单 + 禁用子串 + 两路 `Content-Length` 相等），
@@ -321,7 +332,8 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 #12 由 `test_segment_algo_version_invalidates_cache` / `test_stimuli_algo_version_moves_cache_dir` 覆盖；
 #13 由 `test_cut_segment_drops_attached_picture` / `test_import_strips_attached_picture` /
 `test_start_with_cover_art_source_builds_stimuli` 覆盖；#14 由 `test_answer_is_final_and_replay_is_idempotent`
-覆盖；#15 由 `test_questions_shuffle_but_keep_identical_stimulus_set` / `test_stimuli_cached_and_reusable` 覆盖。
+覆盖；#15 由 `test_questions_shuffle_but_keep_identical_stimulus_set` / `test_stimuli_cached_and_reusable` 覆盖；
+#16 由 `test_static_assets_are_revalidated` 覆盖（含"前端不再引用旧 `correct_side` 字段"的静态断言）。
 **只有 #2（浏览器实操）与 #7 的主观听感需要人来点一遍。**
 
 ## 10. 非目标
@@ -357,7 +369,7 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 # 前置：系统已有 ffmpeg / ffprobe（实测 6.1.1）；本项目不 apt install、不装任何全局包
 make install     # = pip install -r requirements.txt（解释器自动探测，可用 PY= 覆盖）
 make run         # 前台启动（Ctrl+C 停止）；或 make run-bg 后台启动 + make stop 停止
-make test        # 58 项自动化测试（需要 make install-dev）
+make test        # 59 项自动化测试（需要 make install-dev）
 ```
 
 - **解释器**：`Makefile` 的 `PY` 会按「项目内 `.venv` → 作者的 conda 环境 `tin_ear` → `python3` → `python`」
@@ -412,7 +424,8 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
   缓存复用计数、WAV 头规范（48 kHz / 2ch / 720000 / FLOAT）。
 - `tests/test_api.py`：导入与去重（含带封面源的导入）、有损格式拒绝、删除与 409（含"答完全部题目后即可删除"的回归）、
   题目参数校验、**防泄漏**、`reveal` 只在作答后返回且只含本题、首答即最终与幂等重放、安慰剂两路内容相同、
-  带封面源的端到端出题回归、结果统计（p 值/显著/样本不足）与结论文案、启动清理、TTL 清理、路径穿越。
+  带封面源的端到端出题回归、结果统计（p 值/显著/样本不足/`status` 枚举）与结论文案、
+  **静态资源强制重验证**（`test_static_assets_are_revalidated`）、启动清理、TTL 清理、路径穿越。
 - 测试产物全部落在 `data/tmp/`（受 `TMPDIR` 约束），不写系统 temp 或用户目录。
 
 ## 15. 实测数据与实现记录（ffmpeg 6.1.1-3ubuntu5 / Python 3.12.15）
@@ -431,7 +444,7 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 | 统计口径实测 | `POWER_REQUIRED_N = 7`；20/20 的精确 p = 2.9e-10（`p<0.001`）；22 题一轮的安慰剂位置实测出现过 [0, 17]（即被正确打散） |
 | 依赖 | 全部 wheel（soundfile 自带 libsndfile），无需编译器或系统库 |
 
-实现期间修掉的四个真问题（都已加测试守护）：
+实现期间修掉的五个真问题（都已加测试守护）：
 
 1. **`-ss` 位置**：输出 seek（`-i` 之后）在 `start=40s` 会输出整段静音，必须用输入 seek。
 2. **对齐精修符号**：`_estimate_lag` 精修阶段的平移方向与负延迟覆盖写反，需与 `_shifted` 保持一致
@@ -441,3 +454,9 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 4. **内嵌封面流**（对应 §6 修正）：`-map_metadata -1` 清不掉 `attached_pic` 视频流，切片时必须 `-map 0:a:0`，
    否则封面帧进入片段、MP3 muxer 试图写 ID3v2 APIC 而被 `-id3v2_version 0` 拒绝 → rc=234。
    注意该 bug 只在"最佳片段起点 = 0"时触发（起点 > 0 时封面帧落在窗口外）。
+5. **浏览器缓存旧 `app.js` 导致的静默失败**：揭晓改成 `reveal` 之后，旧脚本仍去读 `data.correct_side`，
+   拿到 `undefined` 后在 `undefined.toUpperCase()` 上抛异常；而它抛异常前已经先把「查看答案」按钮
+   `hidden` 掉了，于是用户只看到"按钮消失、页面什么都不显示"。修法三条同时上：
+   `/` 与 `/static/*` 强制重验证（§7）、`index.html` 用 `?v=N` 引用资源、揭晓函数改成**任何分支都显示东西**
+   （拿不到 `reveal` 就提示强制刷新）。由 `test_static_assets_are_revalidated` 守护。
+   > 教训：凡是"点了按钮但什么都没发生"的交互，函数里都不能有会抛异常的隐式假设。

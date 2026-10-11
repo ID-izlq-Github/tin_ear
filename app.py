@@ -1036,7 +1036,11 @@ POWER_REQUIRED_N = _required_n()
 
 
 def _row_stats(correct: int, total: int) -> dict:
-    """一行统计：计数 + 描述性 Wilson 区间 + 单侧精确二项检验（H0 = 1/3）。"""
+    """一行统计：计数 + 描述性 Wilson 区间 + 单侧精确二项检验（H0 = 1/3）。
+
+    `status` 是给前端做视觉分级的稳定枚举：
+    `insufficient`（样本不足）/ `significant`（显著高于瞎猜）/ `not_significant`（无显著差异）。
+    """
     if total <= 0:
         return {
             "n": 0,
@@ -1046,16 +1050,20 @@ def _row_stats(correct: int, total: int) -> dict:
             "ci_high": 0.0,
             "p_value": None,
             "significant": False,
+            "status": "insufficient",
             "note": "没有作答",
         }
     low, high = _wilson_interval(correct, total)
     p_value = _binom_p_value(correct, total)
     significant = total >= MIN_N_FOR_SIGNIFICANCE and p_value is not None and p_value < ALPHA
     if total < MIN_N_FOR_SIGNIFICANCE:
+        status = "insufficient"
         note = f"样本不足（n<{MIN_N_FOR_SIGNIFICANCE}，无法判定）"
     elif significant:
+        status = "significant"
         note = "显著高于瞎猜基线"
     else:
+        status = "not_significant"
         note = "与瞎猜基线无显著差异"
     return {
         "n": total,
@@ -1066,6 +1074,7 @@ def _row_stats(correct: int, total: int) -> dict:
         # 不四舍五入：20/20 的精确 p 是 2.9e-10，舍入到 4 位会变成误导性的 0.0
         "p_value": p_value,
         "significant": significant,
+        "status": status,
         "note": note,
     }
 
@@ -1106,13 +1115,17 @@ def _build_result(state: SessionState) -> dict:
         by_bracket.append({"label": label, "range": [low, high], **_row_stats(correct_of(items), len(items))})
 
     placebo_ties = sum(1 for q in placebo if state.answers[q.question_id]["choice"] == "tie")
+    placebo_rate = round(placebo_ties / len(placebo), 4) if placebo else None
     placebo_row = {
         "n": len(placebo),
         "tie": placebo_ties,
-        "tie_rate": round(placebo_ties / len(placebo), 4) if placebo else None,
+        "tie_rate": placebo_rate,
+        # 在"其实没有差异"的题上仍听出更好的一边 → 提示瞎猜倾向
+        "warning": bool(placebo) and placebo_rate is not None and placebo_rate < 0.5,
     }
 
     overall = _row_stats(correct_of(real), len(real))
+    max_per_bitrate = max((row["n"] for row in by_bitrate), default=0)
     return {
         "mode": state.mode,
         "total": len(state.questions),
@@ -1128,6 +1141,13 @@ def _build_result(state: SessionState) -> dict:
         "chance_level": round(CHANCE_LEVEL, 4),
         "alpha": ALPHA,
         "power_required_n": POWER_REQUIRED_N,
+        # 给前端渲染"样本量说明"用的结构化信息（避免前端去解析中文字符串）
+        "power": {
+            "required_n": POWER_REQUIRED_N,
+            "max_per_bitrate": max_per_bitrate,
+            "target_power": POWER_TARGET,
+            "assumed_rate": P1_FOR_POWER,
+        },
         "conclusion": _conclusion(overall, by_bracket, by_bitrate, placebo_row),
     }
 
@@ -1203,6 +1223,21 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="TinEar", lifespan=lifespan)
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.middleware("http")
+async def _revalidate_static_assets(request, call_next):
+    """HTML / JS / CSS 一律要求浏览器重验证。
+
+    否则浏览器可能继续用缓存里的旧 app.js 去调新 API —— 症状是"点查看答案按钮消失、
+    什么都不显示"（旧脚本读 data.correct_side，而新接口已改成 reveal，取属性时抛异常）。
+    本项目是本地工具，静态资源很小，重验证（命中 ETag 时是 304）没有任何负担。
+    """
+    response = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.startswith("/static/") or path == "/index.html":
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
 
 
 class StartRequest(BaseModel):

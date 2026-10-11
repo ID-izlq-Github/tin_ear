@@ -377,16 +377,20 @@ def test_row_stats_marks_small_samples_as_undecidable():
     tiny = app_module._row_stats(1, 1)
     assert tiny["p_value"] == pytest.approx(1 / 3, abs=1e-4)
     assert tiny["significant"] is False
+    assert tiny["status"] == "insufficient"
     assert "样本不足" in tiny["note"]
 
     clear = app_module._row_stats(5, 5)
     assert clear["significant"] is True
+    assert clear["status"] == "significant"
     assert "显著高于瞎猜基线" in clear["note"]
 
     noise = app_module._row_stats(1, 4)
     assert noise["significant"] is False
+    assert noise["status"] == "not_significant"
     assert "无显著差异" in noise["note"]
 
     empty = app_module._row_stats(0, 0)
     assert empty["p_value"] is None and empty["accuracy"] is None
     assert empty["significant"] is False
+    assert empty["status"] == "insufficient"

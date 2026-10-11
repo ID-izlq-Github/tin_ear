@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TinEar · 本地音频盲测</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=5">
 </head>
 <body>
 <header class="top">
@@ -84,13 +84,21 @@
   <section id="view-result" class="view hidden">
     <div class="card">
       <h2>测试结果</h2>
-      <div id="conclusion" class="conclusion"></div>
+      <div id="summary-card" class="summary"></div>
+
       <h3>按码率分档</h3>
-      <table id="bracket-table" class="table"></table>
+      <div class="table-wrap"><table id="bracket-table" class="table"></table></div>
+
       <h3>逐档明细</h3>
-      <table id="bitrate-table" class="table"></table>
-      <div id="stats-note" class="hint"></div>
-      <div id="placebo-line" class="placebo"></div>
+      <div class="table-wrap"><table id="bitrate-table" class="table"></table></div>
+
+      <details class="note-toggle">
+        <summary>统计口径与样本量说明</summary>
+        <div id="stats-note" class="hint"></div>
+        <p class="hint">纯文本结论（便于复制）：</p>
+        <div id="conclusion-text" class="hint plain"></div>
+      </details>
+
       <div class="row">
         <button id="btn-retest" class="btn primary">再测一次</button>
         <button id="btn-back" class="btn">返回音频库</button>
@@ -99,6 +107,6 @@
   </section>
 </main>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=5"></script>
 </body>
 </html>
