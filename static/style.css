@@ -98,6 +98,8 @@ main { max-width: 760px; margin: 0 auto; padding: 12px 16px 48px; }
 .test-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; font-size: 15px; }
 .progress { flex: 1; height: 8px; background: var(--card-2); border-radius: 999px; overflow: hidden; }
 .progress > div { height: 100%; width: 0; background: var(--accent); transition: width 0.2s; }
+/* 准备阶段的进度条：独立一行，位于「开始盲测」按钮下方 */
+#prepare-progress { margin-top: 12px; }
 
 .ab { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 20px 0 4px; }
 .ab-btn {

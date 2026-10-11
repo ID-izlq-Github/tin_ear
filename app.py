@@ -64,7 +64,7 @@ SEGMENT_STEP_SECONDS = 5
 SEGMENT_SAMPLES = SAMPLE_RATE * SEGMENT_SECONDS  # 720000 = 恰好 625 个 MP3 帧
 SEGMENT_FADE_SECONDS = 0.02
 SEGMENT_ALGO_VERSION = 1
-STIMULI_ALGO_VERSION = 2  # 刺激缓存版本：任何改变刺激内容的常量/参数都要 bump
+STIMULI_ALGO_VERSION = 2  # 测试音频缓存版本：任何改变其内容的常量/参数都要 bump
 #                           （v2：TARGET_LUFS 由 -23 提到 -18 LUFS）
 
 TARGET_LUFS = -18.0
@@ -102,7 +102,32 @@ ALIGN_REFINE_SECONDS = 8
 ALIGN_MAX_LAG = 8192
 ALIGN_REFINE_SPAN = 64
 STIMULUS_SUBTYPE = "FLOAT"  # 回退项 "PCM_24"
-FFMPEG_CONCURRENCY = 2
+STIMULI_CONCURRENCY_MAX = 8  # 单题生成实测 ~0.70 s，8 路之后基本饱和（见 AGENTS.md §15）
+
+
+def _detect_cpu_count() -> int:
+    """可用核数：优先亲和集（Linux/WSL/容器里比 os.cpu_count() 准），回退 cpu_count。"""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:  # Windows 没有这个函数
+        return os.cpu_count() or 4
+
+
+def _resolve_concurrency() -> int:
+    """测试音频生成的并发数：按机器核数自适应，封顶 STIMULI_CONCURRENCY_MAX。
+
+    实测（本机 24 核、detailed 22 题冷启动）：1 路 15.3 s / 4 路 5.0 s / 8 路 3.9 s /
+    12 路 3.5 s —— 8 之后收益很小，低核机器取核数即可。
+    `TINEAR_CONCURRENCY` 环境变量可覆盖（排查问题与测试用）。
+    """
+    override = os.environ.get("TINEAR_CONCURRENCY", "").strip()
+    if override.isdigit() and int(override) > 0:
+        return int(override)
+    return max(1, min(_detect_cpu_count(), STIMULI_CONCURRENCY_MAX))
+
+
+STIMULI_CONCURRENCY = _resolve_concurrency()
+FFMPEG_CONCURRENCY = STIMULI_CONCURRENCY  # ffmpeg 子进程槽位不再比任务槽位更窄
 MAX_UPLOAD_BYTES = 2 * 1024**3
 LOSSLESS_CODECS = {"flac", "alac", "wavpack", "tta"}
 MIN_SOURCE_SAMPLE_RATE = 44100
@@ -186,6 +211,25 @@ _ENCODER_TAG = _ffmpeg_version()
 
 _FFMPEG_SEM = asyncio.Semaphore(FFMPEG_CONCURRENCY)
 _LIBRARY_LOCK = asyncio.Lock()
+# 共享资源的锁按「事件循环 + key」存放，见 _loop_scoped_lock 的说明
+_CACHE_INDEX_LOCKS: dict[tuple[object, str], asyncio.Lock] = {}
+
+
+def _loop_scoped_lock(box: dict[tuple[object, str], asyncio.Lock], key: str) -> asyncio.Lock:
+    """取「当前事件循环 + key」对应的一把锁。
+
+    为什么不能直接用模块级 `asyncio.Lock`：它一旦被**争用**（真的有人等）就会绑定到当时的
+    事件循环，之后在另一个循环里再争用会抛 `... is bound to a different event loop`。
+    生产环境只有一个循环，但 pytest 每个用例都用新的循环跑 TestClient，跨用例复用同一把锁
+    就会炸；按循环分桶既保留串行语义，也不会把上一个循环的锁带过来。
+    """
+    loop = asyncio.get_running_loop()
+    full_key = (loop, key)
+    lock = box.get(full_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        box[full_key] = lock
+    return lock
 
 
 async def _run_process(args: list[str], capture_stdout: bool = False):
@@ -196,7 +240,13 @@ async def _run_process(args: list[str], capture_stdout: bool = False):
             stdout=asyncio.subprocess.PIPE if capture_stdout else asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        out, err = await proc.communicate()
+        try:
+            out, err = await proc.communicate()
+        except asyncio.CancelledError:
+            # 并发准备中途失败会取消其余任务：别把 ffmpeg 子进程留成孤儿
+            proc.kill()
+            await proc.wait()
+            raise
     return proc.returncode, out or b"", err or b""
 
 
@@ -348,7 +398,7 @@ def _prepare_pair(master: np.ndarray, cand: np.ndarray) -> tuple[np.ndarray, np.
 
     peak_in = float(np.max(np.abs(master_fit)))
     if peak_in < 1e-6:
-        raise AudioToolError("片段是数字静音，无法生成盲测刺激（请检查源文件）")
+        raise AudioToolError("片段是数字静音，无法生成盲测音频（请检查源文件）")
 
     lufs_ll = _integrated_loudness(master_fit)
     lufs_mp3 = _integrated_loudness(aligned)
@@ -384,7 +434,7 @@ def _prepare_pair(master: np.ndarray, cand: np.ndarray) -> tuple[np.ndarray, np.
         if not math.isfinite(value):
             raise AudioToolError(f"{key} 非有限值（{value}）")
     if info["n_samples"] != SEGMENT_SAMPLES:
-        raise AudioToolError(f"刺激长度异常：{info['n_samples']} != {SEGMENT_SAMPLES}")
+        raise AudioToolError(f"测试音频长度异常：{info['n_samples']} != {SEGMENT_SAMPLES}")
     if info["lufs_diff"] > MAX_LUFS_DIFF_LU:
         raise AudioToolError(f"两路响度差过大：{info['lufs_diff']} LU")
     if info["true_peak_db"] > TRUE_PEAK_DBTP + TRUE_PEAK_SLACK_DB:
@@ -660,7 +710,22 @@ def _segments_meta_path(audio_id: str) -> Path:
     return CACHE_DIR / audio_id / "meta.json"
 
 
+# 每个 audio_id 一把锁：并发准备测试音频时，多个任务会同时走到 _ensure_segments，
+# 没有锁的话两边都可能判定"没有片段缓存"，然后各自 rmtree + 重算，互相删掉对方的产物。
+_SEGMENT_LOCKS: dict[tuple[object, str], asyncio.Lock] = {}
+
+
+def _segment_lock(audio_id: str) -> asyncio.Lock:
+    return _loop_scoped_lock(_SEGMENT_LOCKS, audio_id)
+
+
 async def _ensure_segments(audio_id: str) -> dict:
+    """命中片段缓存就直接返回，否则分析 + 切片（同一个 audio_id 同时只允许一个任务在算）。"""
+    async with _segment_lock(audio_id):
+        return await _ensure_segments_locked(audio_id)
+
+
+async def _ensure_segments_locked(audio_id: str) -> dict:
     item = _library_item(audio_id)
     flac = _audio_path(audio_id)
     if not flac.exists():
@@ -743,7 +808,7 @@ async def _cut_segment(flac: Path, out: Path, start: float) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 刺激生成（持久缓存）
+# 测试音频生成（持久缓存）
 # ---------------------------------------------------------------------------
 
 
@@ -760,7 +825,7 @@ def _stimuli_key(seg_index: int, bitrate: int | None, alt_seg: int | None = None
 async def _ensure_stimuli(
     audio_id: str, seg_index: int, bitrate: int | None, alt_seg: int | None = None
 ) -> tuple[dict, bool]:
-    """返回 (刺激条目, 是否命中缓存)。命中缓存只是读 index.json，不重算。"""
+    """返回 (测试音频条目, 是否命中缓存)。命中缓存只是读 index.json，不重算。"""
     meta = await _ensure_segments(audio_id)
     seg_files = {seg["index"]: seg["file"] for seg in meta["segments"]}
     if seg_index not in seg_files:
@@ -819,8 +884,21 @@ async def _ensure_stimuli(
         "encoder": _ENCODER_TAG,
         **info,
     }
-    index.setdefault("entries", {})[key] = entry
-    _write_json(index_path, index)
+    # 并发生成时多个任务会同时读改写 index.json：必须在锁内**重新读一次**再合并，
+    # 否则后写的会覆盖掉别人刚登记的条目（文件在、索引丢 → 下次白重算一遍）。
+    async with _loop_scoped_lock(_CACHE_INDEX_LOCKS, audio_id):
+        current = _read_json(index_path, None)
+        if (
+            not isinstance(current, dict)
+            or current.get("stimuli_algo_version") != STIMULI_ALGO_VERSION
+        ):
+            current = {
+                "stimuli_algo_version": STIMULI_ALGO_VERSION,
+                "encoder": _ENCODER_TAG,
+                "entries": {},
+            }
+        current.setdefault("entries", {})[key] = entry
+        _write_json(index_path, current)
     return entry, False
 
 
@@ -932,18 +1010,96 @@ def _build_questions(mode: str, audio_ids: list[str], segment_indices: dict[str,
     return questions
 
 
-async def _prepare_session(questions: list[Question]) -> dict:
-    """为每道题准备刺激（命中缓存则复用），返回本次新生成/复用的数量。"""
-    generated = 0
-    reused = 0
-    for q in questions:
-        entry, from_cache = await _ensure_stimuli(q.audio_id, q.seg_index, q.bitrate, q.alt_seg)
-        q.stimulus = entry
-        if from_cache:
-            reused += 1
-        else:
-            generated += 1
-    return {"generated": generated, "reused": reused}
+# ---------------------------------------------------------------------------
+# 准备进度（内存态，仅用于界面进度条）
+# ---------------------------------------------------------------------------
+
+PROGRESS: dict[str, dict] = {}
+PROGRESS_TTL_SECONDS = 300
+
+
+def _progress_begin(token: str | None, *, phase: str, total: int) -> None:
+    if not token:
+        return
+    PROGRESS[token] = {
+        "phase": phase,
+        "done": 0,
+        "total": max(0, total),
+        "finished": False,
+        "error": None,
+        "updated_at": time.time(),
+    }
+
+
+def _progress_update(
+    token: str | None, *, phase: str | None = None, done: int | None = None, total: int | None = None
+) -> None:
+    entry = PROGRESS.get(token) if token else None
+    if entry is None:
+        return
+    if phase is not None:
+        entry["phase"] = phase
+    if done is not None:
+        entry["done"] = done
+    if total is not None:
+        entry["total"] = total
+    entry["updated_at"] = time.time()
+
+
+def _progress_finish(token: str | None, error: str | None = None) -> None:
+    entry = PROGRESS.get(token) if token else None
+    if entry is None:
+        return
+    entry["finished"] = True
+    entry["error"] = error
+    if error is None:
+        entry["done"] = entry["total"]
+    entry["updated_at"] = time.time()
+
+
+def _progress_purge() -> None:
+    now = time.time()
+    for token, entry in list(PROGRESS.items()):
+        if now - entry["updated_at"] > PROGRESS_TTL_SECONDS:
+            PROGRESS.pop(token, None)
+
+
+async def _prepare_session(questions: list[Question], progress_token: str | None = None) -> dict:
+    """为每道题准备测试音频（命中缓存则复用），返回本次新生成/复用的数量。
+
+    并发执行：单题约 0.70 s（响度+对齐 0.46 s、ffmpeg 编解码 0.25 s），逐题串行时
+    22 题要 15 s 以上；按核数并发（默认封顶 8）实测 3.9 s。
+    `STIMULI_CONCURRENCY` 同时决定任务槽位与 ffmpeg 子进程槽位。
+    """
+    total = len(questions)
+    semaphore = asyncio.Semaphore(STIMULI_CONCURRENCY)
+    entries: dict[int, dict] = {}
+    counters = {"generated": 0, "reused": 0, "done": 0}
+
+    async def prepare_one(position: int, question: Question) -> None:
+        async with semaphore:
+            entry, from_cache = await _ensure_stimuli(
+                question.audio_id, question.seg_index, question.bitrate, question.alt_seg
+            )
+        entries[position] = entry
+        counters["reused" if from_cache else "generated"] += 1
+        counters["done"] += 1
+        # 单事件循环里读改写之间没有 await，计数不会互相覆盖
+        _progress_update(progress_token, done=counters["done"], total=total, phase="stimuli")
+
+    tasks = [asyncio.create_task(prepare_one(i, q)) for i, q in enumerate(questions)]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        # 任何一题失败都要收掉其余任务，否则接口已经返回 500 了后台还在跑 ffmpeg
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+    for position, question in enumerate(questions):
+        question.stimulus = entries[position]
+    return {"generated": counters["generated"], "reused": counters["reused"]}
 
 
 def _reveal(question: Question) -> dict:
@@ -1244,6 +1400,7 @@ async def _revalidate_static_assets(request, call_next):
 class StartRequest(BaseModel):
     audio_ids: list[str]
     mode: str
+    progress_token: str | None = None
 
 
 class AnswerRequest(BaseModel):
@@ -1264,7 +1421,7 @@ async def index() -> FileResponse:
 
 @app.get("/api/library")
 async def api_library() -> dict:
-    # cache_bytes = 界面「清理刺激缓存」按钮会释放的量（data/cache：片段 + 刺激）
+    # cache_bytes = 界面「清理测试音频缓存」按钮会释放的量（data/cache：片段 + 测试音频）
     # tmp_bytes   = 草稿区占用（data/tmp：上传落盘 / ffmpeg 中间文件），后端每次启动自动清空，
     #               不由那个按钮负责 —— 分开报，界面才不会让人误以为按钮没生效。
     return {
@@ -1272,6 +1429,19 @@ async def api_library() -> dict:
         "cache_bytes": _dir_size(CACHE_DIR),
         "tmp_bytes": _dir_size(TMP_DIR),
     }
+
+
+@app.get("/api/progress")
+async def api_progress(token: str = Query(...)) -> dict:
+    """准备进度（前端进度条用）：token 由前端生成并随 /api/start 一起提交。
+
+    只读内存字典，命不中就返回 found=false —— 前端因此不需要额外处理 404。
+    """
+    _progress_purge()
+    entry = PROGRESS.get(token)
+    if entry is None:
+        return {"found": False}
+    return {"found": True, **entry}
 
 
 @app.post("/api/library/upload")
@@ -1306,24 +1476,37 @@ async def api_delete_library(audio_id: str) -> dict:
 @app.post("/api/start")
 async def api_start(request: StartRequest) -> dict:
     _cleanup_sessions()
+    _progress_purge()
     if request.mode not in ("short", "detailed"):
         raise HTTPException(status_code=400, detail="mode 必须是 short 或 detailed")
-    audio_ids = list(dict.fromkeys(request.audio_ids))
+    # 固定顺序：同一批素材必须给出同一张题表，否则 (片段, 码率) 组合会变、缓存命中率退化。
+    # 前端是按**勾选顺序**发送的（Set 的迭代顺序），所以这里统一按库内顺序排序。
+    library_order = {item["audio_id"]: i for i, item in enumerate(_library()["items"])}
+    audio_ids = sorted(
+        dict.fromkeys(request.audio_ids),
+        key=lambda audio_id: (library_order.get(audio_id, 1 << 30), audio_id),
+    )
     if not 1 <= len(audio_ids) <= 3:
         raise HTTPException(status_code=400, detail="请选择 1～3 个音频")
     for audio_id in audio_ids:
         _library_item(audio_id)
 
+    progress_token = request.progress_token
+    _progress_begin(progress_token, phase="segments", total=len(audio_ids))
     segment_indices: dict[str, list[int]] = {}
-    for audio_id in audio_ids:
+    for position, audio_id in enumerate(audio_ids):
         meta = await _ensure_segments(audio_id)
         segment_indices[audio_id] = [seg["index"] for seg in meta["segments"]]
+        _progress_update(progress_token, done=position + 1)
 
     questions = _build_questions(request.mode, audio_ids, segment_indices)
+    _progress_update(progress_token, phase="stimuli", done=0, total=len(questions))
     try:
-        stimuli = await _prepare_session(questions)
+        stimuli = await _prepare_session(questions, progress_token)
     except AudioToolError as exc:
-        raise HTTPException(status_code=500, detail=f"生成刺激失败：{exc}") from exc
+        detail = f"生成测试音频失败：{exc}"
+        _progress_finish(progress_token, error=detail)
+        raise HTTPException(status_code=500, detail=detail) from exc
 
     session_id = secrets.token_hex(8)
     session_dir = SESSION_DIR / session_id
@@ -1341,16 +1524,17 @@ async def api_start(request: StartRequest) -> dict:
         role_tokens: dict[str, str] = {}
         for role in ("ll", "mp3"):
             source = _stimuli_dir(question.audio_id) / files[role]
-            token = secrets.token_hex(8)
-            target = session_dir / f"{token}.wav"
+            audio_token = secrets.token_hex(8)
+            target = session_dir / f"{audio_token}.wav"
             try:
                 os.link(source, target)
             except OSError:
                 shutil.copy2(source, target)
-            state.manifest[token] = str(target)
-            role_tokens[role] = token
+            state.manifest[audio_token] = str(target)
+            role_tokens[role] = audio_token
         state.tokens[question.question_id] = role_tokens
     SESSIONS[session_id] = state
+    _progress_finish(progress_token)
     return {**state.to_public(), "stimuli": stimuli, "target_lufs": TARGET_LUFS}
 
 
@@ -1362,13 +1546,13 @@ async def api_question(session_id: str = Query(...), index: int = Query(...)) ->
     question = state.questions[index]
     role_tokens = state.tokens.get(question.question_id)
     if not role_tokens:
-        raise HTTPException(status_code=500, detail="题目刺激缺失")
+        raise HTTPException(status_code=500, detail="题目音频缺失")
     url_for: dict[str, str] = {}
     for question_role, role in (("a", "ll" if question.lossless_is_a else "mp3"),
                                 ("b", "mp3" if question.lossless_is_a else "ll")):
         token = role_tokens.get(role)
         if token is None:
-            raise HTTPException(status_code=500, detail="题目刺激缺失")
+            raise HTTPException(status_code=500, detail="题目音频缺失")
         url_for[question_role] = f"/api/audio/{session_id}/{token}"
     return {
         "index": index,

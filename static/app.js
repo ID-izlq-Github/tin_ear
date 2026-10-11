@@ -39,9 +39,11 @@ const audio = {
 const FADE = 0.005; // 5 ms 淡入淡出
 const VOLUME_FLOOR_DB = -40; // 滑条到底 = 静音
 const VOLUME_STEP_DB = 2; // 键盘 ±2 dB
+const PROGRESS_POLL_MS = 350; // 准备进度轮询间隔
+const PROGRESS_SHOW_DELAY_MS = 300; // 命中缓存时几毫秒就结束了，进度条不要闪一下
 
 /* 试听音量：监听级增益节点，A/B 共用同一个节点，所以不可能只把一边调响。
-   刺激文件本身已归一到后端常量 TARGET_LUFS（见 /api/start 的 target_lufs），
+   测试音频本身已归一到后端常量 TARGET_LUFS（见 /api/start 的 target_lufs），
    所以默认 0 dB 就是"文件原样播放"。 */
 function volumeDb() {
   const slider = $('volume-input');
@@ -103,6 +105,38 @@ function formatDuration(seconds) {
   const total = Math.round(seconds || 0);
   const minutes = Math.floor(total / 60);
   return `${minutes}:${String(total % 60).padStart(2, '0')}`;
+}
+
+/* 准备进度：token 由前端生成，随 /api/start 一起提交；生成期间轮询 /api/progress。
+   命中缓存时几毫秒就结束 —— 所以进度条延迟 PROGRESS_SHOW_DELAY_MS 再显示，避免闪一下。 */
+function makeProgressToken() {
+  if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
+  return `p${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function progressText(entry) {
+  if (!entry || !entry.found) return '正在准备测试音频…';
+  const done = entry.done || 0;
+  const total = entry.total || 0;
+  if (entry.phase === 'segments') {
+    return total > 1 ? `正在分析并切分片段（${done}/${total} 段素材）…` : '正在分析并切分片段…';
+  }
+  return total ? `正在生成测试音频（${done}/${total}）…` : '正在准备测试音频…';
+}
+
+function showPrepareProgress(done, total) {
+  const wrap = $('prepare-progress');
+  const bar = $('prepare-progress-bar');
+  if (!wrap || !bar) return;
+  wrap.classList.remove('hidden');
+  bar.style.width = `${total > 0 ? Math.round((done / total) * 100) : 0}%`;
+}
+
+function hidePrepareProgress() {
+  const wrap = $('prepare-progress');
+  const bar = $('prepare-progress-bar');
+  if (wrap) wrap.classList.add('hidden');
+  if (bar) bar.style.width = '0%';
 }
 
 function formatSize(bytes) {
@@ -446,10 +480,10 @@ function renderLibrary() {
   }
   $('selected-count').textContent = String(state.selected.size);
   $('btn-start').disabled = state.selected.size < 1;
-  $('btn-clear-cache').textContent = `清理刺激缓存（${formatSize(cacheBytes)}）`;
+  $('btn-clear-cache').textContent = `清理测试音频缓存（${formatSize(cacheBytes)}）`;
   $('btn-clear-cache').disabled = cacheBytes === 0;
   $('cache-info').textContent =
-    `刺激缓存 ${formatSize(cacheBytes)}（上面那个按钮释放的就是它；下次测试重新生成）`
+    `测试音频缓存 ${formatSize(cacheBytes)}（上面那个按钮释放的就是它；下次测试重新生成）`
     + ` · 临时文件 ${formatSize(state.tmpBytes || 0)}（上传/编码草稿，后端每次启动自动清空，不需要手动管）`;
 }
 
@@ -465,7 +499,7 @@ function toggleSelect(audioId, checked) {
 }
 
 async function deleteItem(audioId, displayName) {
-  if (!window.confirm(`删除「${displayName}」？对应的片段与刺激缓存也会一起删除。`)) return;
+  if (!window.confirm(`删除「${displayName}」？对应的片段与测试音频缓存也会一起删除。`)) return;
   try {
     await api(`/api/library/${encodeURIComponent(audioId)}`, { method: 'DELETE' });
     state.selected.delete(audioId);
@@ -528,12 +562,35 @@ async function startTest() {
   await endSession(); // 先收掉上一轮，避免留下"进行中"的引用
   const mode = document.querySelector('input[name="mode"]:checked').value;
   $('btn-start').disabled = true;
-  setStatus('prepare-status', '正在准备刺激：已有的片段直接复用，缺的才生成并做响度/对齐校准…');
+  hidePrepareProgress();
+  setStatus('prepare-status', '正在准备测试音频：已有的片段直接复用，缺的才生成并做响度/对齐校准…');
+
+  // 进度：POST 还在飞的时候轮询 /api/progress（冷启动要十几秒，暖缓存几毫秒）
+  const progressToken = makeProgressToken();
+  const startedAt = Date.now();
+  let polling = true; // 结束后可能还有一次在飞的查询，不能让它把"就绪"提示覆盖回去
+  const poller = window.setInterval(async () => {
+    try {
+      const entry = await api(`/api/progress?token=${encodeURIComponent(progressToken)}`);
+      if (!polling) return;
+      if (!entry || !entry.found) return;
+      if (Date.now() - startedAt < PROGRESS_SHOW_DELAY_MS) return; // 太快就别显示进度条
+      setStatus('prepare-status', progressText(entry));
+      showPrepareProgress(entry.done || 0, entry.total || 0);
+    } catch (error) {
+      /* 进度查询失败不影响主流程，静默忽略 */
+    }
+  }, PROGRESS_POLL_MS);
+
   try {
     const data = await api('/api/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ audio_ids: Array.from(state.selected), mode }),
+      body: JSON.stringify({
+        audio_ids: Array.from(state.selected),
+        mode,
+        progress_token: progressToken,
+      }),
     });
     state.sessionId = data.session_id;
     state.total = data.total;
@@ -542,19 +599,22 @@ async function startTest() {
     const stimuli = data.stimuli;
     setStatus(
       'prepare-status',
-      stimuli ? `刺激就绪：新生成 ${stimuli.generated} 个，复用 ${stimuli.reused} 个。` : '',
+      stimuli ? `测试音频就绪：新生成 ${stimuli.generated} 段，复用 ${stimuli.reused} 段。` : '',
       'ok'
     );
     // 让用户知道文件本身已经归一到多少 LUFS（这样"要不要调滑条"心里有数）
     if ($('volume-hint') && data.target_lufs !== undefined) {
       $('volume-hint').textContent =
-        `刺激已等响归一化到 ${data.target_lufs} LUFS（A/B 同步）；滑条只影响试听响度，不影响判定`;
+        `测试音频已等响归一化到 ${data.target_lufs} LUFS（A/B 同步）；滑条只影响试听响度，不影响判定`;
     }
     applyVolume();
     await loadQuestion(0);
   } catch (error) {
     setStatus('prepare-status', `准备失败：${error.message}`, 'error');
   } finally {
+    polling = false;
+    window.clearInterval(poller);
+    hidePrepareProgress();
     state.busy = false;
     $('btn-start').disabled = state.selected.size < 1;
   }
@@ -765,10 +825,10 @@ function wireEvents() {
     setStatus('upload-status', `刷新失败：${error.message}`, 'error');
   }));
   $('btn-clear-cache').addEventListener('click', async () => {
-    if (!window.confirm('清空所有片段与刺激缓存？库里的音频不受影响，下次测试会重新生成。')) return;
+    if (!window.confirm('清空所有片段与测试音频缓存？库里的音频不受影响，下次测试会重新生成。')) return;
     try {
       const data = await api('/api/cache', { method: 'DELETE' });
-      setStatus('upload-status', `已清理刺激缓存，释放 ${formatSize(data.freed_bytes)}。`, 'ok');
+      setStatus('upload-status', `已清理测试音频缓存，释放 ${formatSize(data.freed_bytes)}。`, 'ok');
       await loadLibrary();
     } catch (error) {
       setStatus('upload-status', `清理失败：${error.message}`, 'error');

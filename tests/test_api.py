@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import os
 import subprocess
 
@@ -274,7 +275,23 @@ def test_start_deduplicates_repeated_audio_ids(client, fast_config, long_source)
     assert session["total"] == 2  # 快速模式 1 真实 + 1 安慰剂
 
 
-def test_question_does_not_leak_bitrate_or_codec(client, fast_config, long_source):
+def test_question_does_not_leak_bitrate_or_codec(client, fast_config, long_source, monkeypatch):
+    """作答之前，响应里不能出现码率 / 编码器 / 文件名 / 是否安慰剂。
+
+    注意随机 token：它是 16 位 hex，**偶尔会恰好包含码率数字**（例如 `47398a8e90e79657` 里有 `96`），
+    那是巧合而不是泄漏 —— 但它会让下面 `str(bitrate) not in token` 这条断言变成约 6% 的假阳性
+    （实测在 HEAD 上撞到过，见 AGENTS.md §16）。这里把随机源换成"只含字母、且互不相同"的确定序列，
+    断言才是确定的；token 仍然与码率无关，这条检查要防的是"有人把码率编进 token"。
+    """
+    counter = itertools.count()
+    alphabet = "abcdefghijklmnop"  # 16 个字母当 16 进制位：结果不含任何数字
+
+    def fake_token_hex(n: int = 8) -> str:
+        value = next(counter)
+        return "".join(alphabet[(value >> (4 * shift)) & 0xF] for shift in range(2 * n))
+
+    monkeypatch.setattr(app_module.secrets, "token_hex", fake_token_hex)
+
     item = upload(client, long_source)
     session = start_session(client, [item["audio_id"]])
     session_id = session["session_id"]
@@ -530,6 +547,33 @@ def test_static_assets_are_revalidated(client):
     assert "data.correct_side" not in script.text
     assert "correctSide" not in script.text
     assert "reveal.sides" in script.text
+
+
+def test_progress_endpoint_reports_generation(client, fast_config, long_source):
+    """准备进度：完成后能拿到终态；未知 token 返回 found=false（前端不必处理 404）。"""
+    assert client.get("/api/progress", params={"token": "nothing"}).json() == {"found": False}
+
+    token = "progress-token-1"
+    item = upload(client, long_source)
+    started = client.post(
+        "/api/start",
+        json={"audio_ids": [item["audio_id"]], "mode": "short", "progress_token": token},
+    ).json()
+    entry = client.get("/api/progress", params={"token": token}).json()
+    assert entry["found"] is True
+    assert entry["finished"] is True and entry["error"] is None
+    assert entry["phase"] == "stimuli"
+    assert entry["total"] == started["total"] == entry["done"]
+
+
+def test_frontend_prepare_progress_is_wired(client):
+    index = client.get("/").text
+    assert 'id="prepare-progress"' in index
+    assert 'id="prepare-progress-bar"' in index
+
+    script = client.get("/static/app.js").text
+    assert "progress_token" in script, "要把 token 随 /api/start 一起提交"
+    assert "/api/progress?token=" in script, "要轮询进度端点"
 
 
 def test_frontend_volume_slider_is_wired(client, fast_config, long_source):

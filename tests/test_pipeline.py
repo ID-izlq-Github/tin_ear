@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import shutil
 import subprocess
+import time
 
 import numpy as np
 import pytest
@@ -314,6 +317,110 @@ def test_stimulus_wav_headers_are_canonical(client, fast_config, long_source):
         assert info.frames == app_module.SEGMENT_SAMPLES
         assert info.subtype == "FLOAT"
         assert info.format == "WAV"
+
+
+# ---------------------------------------------------------------------------
+# 选曲顺序 / 并发生成 / 准备进度
+# ---------------------------------------------------------------------------
+
+
+def test_selection_order_does_not_change_stimulus_set(
+    client, fast_config, long_source, short_source
+):
+    """前端按**勾选顺序**发送 audio_ids；题表与缓存命中不能因此改变。
+
+    否则同一批素材、只是勾选先后不同，第二轮就会"部分复用、部分重生成"。
+    """
+    a = upload(client, long_source)["audio_id"]
+    b = upload(client, short_source)["audio_id"]
+    first = start_session(client, [a, b])
+    assert first["stimuli"]["generated"] == first["total"]
+
+    second = start_session(client, [b, a])
+    assert second["stimuli"] == {"generated": 0, "reused": second["total"]}
+
+
+def test_concurrent_stimuli_generation_is_identical_to_serial(client, monkeypatch, long_source):
+    """并发生成：索引条目不丢（读改写竞态守护），解码后的样本与串行完全一致。
+
+    注意比较的是**解码后的样本**而不是文件字节：libsndfile 会写一个带时间戳的 `PEAK` chunk，
+    所以同一段数据两次写出的 WAV 文件字节必然不同（音频内容仍然完全一致）。
+    """
+    monkeypatch.setattr(app_module, "SHORT_TEST_BITRATES", [64, 128, 320])
+    monkeypatch.setattr(app_module, "SHORT_TEST_TOTAL", 5)  # 4 真实 + 1 安慰剂
+    audio_id = upload(client, long_source)["audio_id"]
+
+    def run(workers: int) -> tuple[set, dict]:
+        client.delete("/api/cache")
+        monkeypatch.setattr(app_module, "STIMULI_CONCURRENCY", workers)
+        started = start_session(client, [audio_id])
+        root = app_module._stimuli_dir(audio_id)
+        index = json.loads((root / "index.json").read_text("utf-8"))
+        assert len(index["entries"]) == started["total"], "并发下索引条目不能丢"
+        digests = {}
+        for entry in index["entries"].values():
+            for name in entry["files"].values():
+                samples, _ = sf.read(str(root / name), dtype="float32")
+                digests[name] = hashlib.sha256(samples.tobytes()).hexdigest()
+        return set(index["entries"]), digests
+
+    keys_parallel, digests_parallel = run(4)
+    keys_serial, digests_serial = run(1)
+    assert keys_parallel == keys_serial
+    assert digests_parallel == digests_serial
+
+
+def test_concurrency_autodetect(monkeypatch):
+    monkeypatch.delenv("TINEAR_CONCURRENCY", raising=False)
+    detected = app_module._resolve_concurrency()
+    assert 1 <= detected <= app_module.STIMULI_CONCURRENCY_MAX
+    assert app_module.FFMPEG_CONCURRENCY >= 1
+
+    monkeypatch.setenv("TINEAR_CONCURRENCY", "3")
+    assert app_module._resolve_concurrency() == 3
+    monkeypatch.setenv("TINEAR_CONCURRENCY", "0")  # 非法值 → 回退自动探测
+    assert app_module._resolve_concurrency() == detected
+
+
+def test_shared_locks_survive_multiple_event_loops(client, long_source):
+    """回归：模块级 `asyncio.Lock` 一旦被**争用**就绑定当时的事件循环，跨循环再争用会抛
+    `is bound to a different event loop`。pytest 每个用例都是新循环，所以共享资源的锁
+    必须按「事件循环 + key」分桶（`_loop_scoped_lock`）。"""
+    audio_id = upload(client, long_source)["audio_id"]
+    cache_root = app_module.CACHE_DIR / audio_id
+
+    async def cold_segments():
+        # 两个任务同时要算片段：冷缓存 → 后到的那个必然在锁上等一次（这就是"争用"）
+        await asyncio.gather(
+            app_module._ensure_segments(audio_id),
+            app_module._ensure_segments(audio_id),
+        )
+
+    for _ in range(2):  # 两轮各跑在一个全新的 asyncio.run 循环里
+        shutil.rmtree(cache_root, ignore_errors=True)
+        asyncio.run(cold_segments())
+    assert (cache_root / "meta.json").exists()
+
+
+def test_progress_tracking_lifecycle():
+    token = "t-expired"
+    app_module._progress_begin(token, phase="stimuli", total=3)
+    app_module.PROGRESS[token]["updated_at"] = time.time() - app_module.PROGRESS_TTL_SECONDS - 1
+    app_module._progress_purge()
+    assert token not in app_module.PROGRESS
+
+    token = "t-fresh"
+    app_module._progress_begin(token, phase="segments", total=2)
+    app_module._progress_update(token, done=1)
+    assert (app_module.PROGRESS[token]["done"], app_module.PROGRESS[token]["phase"]) == (1, "segments")
+    app_module._progress_update(token, phase="stimuli", done=0, total=5)
+    app_module._progress_update(token, done=5)
+    app_module._progress_finish(token)
+    entry = app_module.PROGRESS[token]
+    assert entry["finished"] is True and entry["error"] is None and entry["done"] == 5
+    app_module._progress_purge()  # 未过期 → 保留
+    assert token in app_module.PROGRESS
+    app_module.PROGRESS.pop(token, None)
 
 
 # ---------------------------------------------------------------------------
