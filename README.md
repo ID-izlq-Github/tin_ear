@@ -36,6 +36,8 @@ soundfile 做解码、对齐与响度分析；前端是**原生 HTML/CSS/JS**（
 
 ### 方式一：venv（通用，推荐给新同学）
 
+**macOS / Linux / WSL**
+
 ```bash
 git clone https://github.com/ID-izlq-Github/tin_ear.git && cd tin_ear
 python3 -m venv .venv
@@ -43,9 +45,19 @@ python3 -m venv .venv
 .venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
+**Windows（PowerShell / CMD）**
+
+```pwsh
+git clone https://github.com/ID-izlq-Github/tin_ear.git
+cd tin_ear
+python -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python -m uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
 然后在浏览器打开 <http://localhost:8000>。
 
-### 方式二：Makefile（作者自用，conda 环境名 `tin_ear`）
+### 方式二：Makefile（作者自用，conda 环境名 `tin_ear`，仅 macOS / Linux / WSL）
 
 ```bash
 make install     # 安装依赖（解释器自动挑选：项目内 .venv → conda 环境 tin_ear → python3）
