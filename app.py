@@ -1766,15 +1766,55 @@ async def api_clear_cache() -> dict:
     return {"freed_bytes": freed}
 
 
+# ---------------------------------------------------------------------------
+# 命令行入口（`python app.py`）
+# ---------------------------------------------------------------------------
+
+
+def _drop_uvicorn_bind_banner(record) -> bool:
+    """过滤掉 uvicorn 的 "Uvicorn running on …" 那一行。
+
+    那行打的是**绑定地址**（默认写成 `0.0.0.0`，而它并不是一个能访问的地址），与我们要展示的
+    "打开 http://localhost:<port>" 并排出现只会让人犹豫该开哪个。`logger.addFilter` 接受任意
+    可调用对象，所以这里用函数而不是 `logging.Filter` 子类。
+    """
+    return "Uvicorn running on" not in record.getMessage()
+
+
+def _startup_lines(host: str, port: int) -> list[str]:
+    """`python app.py` 启动时要打印的行：访问地址 + （仅监听所有网卡时的）安全提示。
+
+    `0.0.0.0` / `::` 表示监听所有网卡，用户该打开的是 localhost；绑了具体网卡就照实显示那个地址
+    （那时 localhost 反而打不开，所以不能一律写 localhost）。
+    """
+    display = "localhost" if host in {"0.0.0.0", "::", "127.0.0.1", "localhost"} else host
+    lines = [f"TinEar 启动中：http://{display}:{port}    （按 Ctrl+C 停止）"]
+    if host in {"0.0.0.0", "::"}:
+        lines.append(
+            "提示：服务监听所有网卡，局域网内其他设备也能打开，而界面没有认证；"
+            "只想本机访问请用 HOST=127.0.0.1 启动。"
+        )
+    return lines
+
+
 if __name__ == "__main__":  # pragma: no cover
     # 最省事的启动入口：`python app.py`（等价于 uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1）。
     # 这里直接传 app 对象、不用 "app:app" 字符串，省掉一次模块导入；会话在内存里，所以固定单进程。
     # HOST / PORT 环境变量可覆盖，与 Makefile 的约定一致。
+    import logging
+    import sys
+
     import uvicorn
 
     _host = os.environ.get("HOST", "0.0.0.0")
     _port = int(os.environ.get("PORT", "8000"))
-    print(f"TinEar 启动中：http://localhost:{_port}    （按 Ctrl+C 停止）")
-    if _host == "0.0.0.0":
-        print("提示：绑定 0.0.0.0 会对局域网开放，而界面没有认证；共享/不可信网络请用 HOST=127.0.0.1 启动。")
-    uvicorn.run(app, host=_host, port=_port)
+    # 走 stderr 且 flush：uvicorn 的日志也在 stderr，两者顺序才正确；而且 stdout 被重定向时是块缓冲的，
+    # 那行提示会一直压到进程退出才出现（被 Ctrl+C 打断时甚至看不到）—— 见 §15 的实测记录。
+    for _line in _startup_lines(_host, _port):
+        print(_line, file=sys.stderr, flush=True)
+
+    # 自己建 Config/Server 而不是调 uvicorn.run()：uvicorn 在 `Config.__init__` 里做 dictConfig，
+    # 在这之后装过滤器才不会被它覆盖（用 uvicorn.run() 就得赌过滤器能活过 dictConfig）。
+    _config = uvicorn.Config(app, host=_host, port=_port, workers=1)
+    logging.getLogger("uvicorn.error").addFilter(_drop_uvicorn_bind_banner)
+    uvicorn.Server(_config).run()

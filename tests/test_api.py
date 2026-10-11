@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import logging
 import os
 import shutil
 import socket
@@ -804,11 +805,41 @@ def test_static_index_is_served(client):
     assert "text/html" in response.headers["content-type"]
 
 
+def test_startup_lines_show_a_reachable_address():
+    """启动提示要打**能打开的地址**：监听所有网卡时显示 localhost，绑具体网卡时照实显示那个地址。"""
+    all_net = app_module._startup_lines("0.0.0.0", 8000)
+    assert all_net[0].startswith("TinEar 启动中：http://localhost:8000")
+    assert len(all_net) == 2 and "没有认证" in all_net[1], "监听所有网卡时要提示局域网可见 + 无认证"
+    assert not any("0.0.0.0" in line for line in all_net), "0.0.0.0 不是能访问的地址，不该出现在提示里"
+
+    loopback = app_module._startup_lines("127.0.0.1", 9000)
+    assert loopback[0].startswith("TinEar 启动中：http://localhost:9000")
+    assert len(loopback) == 1, "只绑本机时不该再吓唬用户"
+
+    bound = app_module._startup_lines("192.168.1.5", 8000)
+    assert bound[0].startswith("TinEar 启动中：http://192.168.1.5:8000"), "绑具体网卡时 localhost 打不开"
+    assert len(bound) == 1
+
+
+def test_uvicorn_bind_banner_is_filtered():
+    """uvicorn 那行 `Uvicorn running on http://0.0.0.0:…` 要拦掉，其余日志照常。"""
+    def record(message: str) -> logging.LogRecord:
+        return logging.LogRecord("uvicorn.error", logging.INFO, __file__, 1, message, None, None)
+
+    banner = record("Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)")
+    assert app_module._drop_uvicorn_bind_banner(banner) is False
+    assert app_module._drop_uvicorn_bind_banner(record("Application startup complete.")) is True
+    assert app_module._drop_uvicorn_bind_banner(record("TinEar 启动中：http://localhost:8000")) is True
+
+
 def test_python_app_py_entry_point_serves_the_api(tmp_path):
-    """README 首推的启动方式 `python app.py` 必须真能起来。
+    """README 首推的启动方式 `python app.py` 必须真能起来，且提示里给的是能打开的地址。
 
     做法：把 app.py 与 static/ 复制到临时目录，再在那边起子进程（`HOST=127.0.0.1 PORT=<空闲端口>`），
-    轮询 /api/library 直到 200，最后把进程收掉。
+    轮询 /api/library 直到 200，最后把进程收掉并检查它的输出。
+
+    这里用 127.0.0.1 而不是默认的 0.0.0.0：测试不该真的监听所有网卡（原生 Windows 上会弹防火墙）。
+    "0.0.0.0 那行 banner 被拦掉"因此靠断言 `Uvicorn running on` 不出现来验证 —— 它跟绑哪个地址无关。
 
     **不能**直接在当前工作区起子进程：app.py 的 `_bootstrap()` 会清空 data/tmp，
     而那正是 pytest 放临时目录的地方（会把本轮测试的合成音频删掉）。
@@ -854,3 +885,8 @@ def test_python_app_py_entry_point_serves_the_api(tmp_path):
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:  # pragma: no cover - 正常路径不会走到
             proc.kill()
+        output = proc.stdout.read()
+
+    assert f"http://localhost:{port}" in output, output
+    assert "Uvicorn running on" not in output, f"绑定地址那行 banner 应被拦掉：\n{output}"
+    assert "0.0.0.0" not in output, output

@@ -139,7 +139,8 @@ n=5 需 4/5（p=0.045）、n=10 需 7/10（p=0.020）。详细模式 20 道真�
 - 缓存键是 **`(audio_id, seg_index, bitrate)`**，没有任何淘汰/过期逻辑：生成过的组合永久保留。
   实测单曲整目录（含 `seg_*.flac` 与 `meta.json` ≈ 3.9 MB）：详细模式（含预热的快速补集）
   **103.3 MB/首**（23 个 WAV）、只跑快速模式 **34.1 MB/首**（7 个 WAV）；两套阶梯并集的档位上限
-  = 11 档 × 2 片段 + 2 份共享无损侧 = 24 个 WAV ≈ 108 MB/首。（MiB 口径见 §15。）
+  = 11 档 × 2 片段 + 2 份共享无损侧 = 24 个 WAV ≈ 108 MB/首。
+  （本节与 §15 的数字都是十进制 MB；界面按 MiB 显示，会比这里小约 5%。）
   **是否命中只取决于这一轮的题表**，
   而题表由「模式 + 素材集合」决定 —— `audio_ids` 在 `/api/start` 里按库内顺序排序，与前端勾选顺序无关，
   所以同素材重测必然 100% 复用（曾经因为直接用勾选顺序做 round-robin，换一下勾选先后就"部分重生成"）。
@@ -226,7 +227,7 @@ n=5 需 4/5（p=0.045）、n=10 需 7/10（p=0.020）。详细模式 20 道真�
   `common_delta == 0` 就能让整个片段共用一份 —— 无损侧从 20 份降到 2 份（§15 实测 253.4 → 132.5 MB）。
   安慰剂 A/B 本来就同文件，此时直接复用这份共享文件。`delta != 0`（把 `TARGET_LUFS` 调到会触发峰值衰减）
   时自动退回每档一份。**判据是内容而不是布局**，所以这条优化不需要开关、不需要先空跑一遍全集、
-  也不需要为它单独 bump `STIMULI_ALGO_VERSION`（当前 v3 的 bump 来自交付位深，见下一条）；
+  也不需要为它单独 bump `STIMULI_ALGO_VERSION`（当前 v3 的 bump 来自交付位深，见本节后文）；
   旧缓存条目的 `files.ll` 指向老文件名，仍然有效，只是老文件不会自己消失。
   并发写同一个共享文件走 `_write_wav_atomic`（临时文件 + `os.replace`）。
 - 压缩版（CBR，且写文件以便 LAME/Xing gapless 头生效）：
@@ -415,34 +416,27 @@ A/B 下面有**试听音量滑条**（−40 dB…0 dB，到底 = 静音；`↑/�
 22. **无损侧在同一片段内共用一份**：`delta == 0` 时同一片段的所有码率（含安慰剂）都指向同一个
     `seg{S}_ll.wav`；触发共同峰值衰减（`common_delta != 0`）时自动退回每档一份。
 
-自动化覆盖对照（`make test`，77 项）：#1 见 README「快速开始」（`python app.py`）；#3/#4/#5 由 `test_api.py`
-的导入与拒绝用例覆盖；#6/#10/#11 由清理用例覆盖（含硬链接 inode 断言、"答完/结束后才能删除"的回归用例，
-以及 `test_clear_cache_only_touches_stimuli_cache`：**「清理测试音频缓存」只清 `data/cache`**，
-不碰 `data/tmp` / `data/session` / `data/library`）；
-#7 的实测值为 `ΔLUFS = 0.0000`（远严于 0.3，`test_prepare_pair_loudness_and_peak` 断言 ≤ 0.05）；
-#7 的「以落盘文件为准」由 `test_stimulus_metadata_matches_written_files`（复测落盘文件并与索引比对）/
-`test_written_pair_verification_rejects_mismatch`（篡改内容或长度不齐时必须报错）覆盖；#8 由
-`test_question_does_not_leak_bitrate_or_codec` 覆盖（键集合白名单 + 禁用子串 + 两路 `Content-Length` 相等），
-"作答后才揭晓"由 `test_answer_reveals_both_sides_only_after_answering` 覆盖；#9 由
-`test_result_counts_correct_answers` / `test_result_flags_guessing` / `test_result_statistics_payload` /
-`test_binom_p_value_and_required_n` / `test_row_stats_marks_small_samples_as_undecidable` 覆盖；
-#12 由 `test_segment_algo_version_invalidates_cache` / `test_stimuli_algo_version_moves_cache_dir` 覆盖；
-#13 由 `test_cut_segment_drops_attached_picture` / `test_import_strips_attached_picture` /
-`test_start_with_cover_art_source_builds_stimuli` 覆盖；#14 由 `test_answer_is_final_and_replay_is_idempotent`
-覆盖；#15 由 `test_questions_shuffle_but_keep_identical_stimulus_set` / `test_stimuli_cached_and_reusable` 覆盖；
-#16 由 `test_static_assets_are_revalidated` 覆盖（含"前端不再引用旧 `correct_side` 字段"的静态断言）；
-#17 由 `test_frontend_volume_slider_is_wired` 覆盖（滑条存在、接线成 `gain → volume → destination`、
-    `/api/start` 返回 `target_lufs == -18.0`）；
-#18 由 `test_selection_order_does_not_change_stimulus_set` 覆盖；#19 由
-`test_concurrent_stimuli_generation_is_identical_to_serial` / `test_concurrency_autodetect` /
-`test_shared_locks_survive_multiple_event_loops` 覆盖；
-#20 由 `test_progress_endpoint_reports_generation` / `test_progress_tracking_lifecycle` /
-`test_frontend_prepare_progress_is_wired` 覆盖；#21 由 `test_detailed_round_prewarms_short_complement` /
-`test_prewarm_is_detailed_only_and_switchable` 覆盖；#22 由
-`test_lossless_side_is_bit_identical_across_bitrates`（共享的**前提**：delta == 0 时不同码率的无损侧
-逐位相同）/ `test_lossless_reference_is_shared_across_bitrates`（每片段恰好一份、安慰剂复用共享文件）/
-`test_sharing_falls_back_when_peak_attenuation_is_needed`（-6 LUFS 强制触发衰减 → 退回每档一份）覆盖。
-**只有 #2（浏览器实操）与 #7 的主观听感需要人来点一遍。**
+自动化覆盖对照（`make test`，79 项；每个用例的细节见 §14）：#1 由
+`test_python_app_py_entry_point_serves_the_api` 覆盖（真起子进程探活，断言输出里是
+`http://localhost:<port>`、没有 `Uvicorn running on` / `0.0.0.0`）；#3/#4/#5 导入与拒绝用例；
+#6/#10/#11 清理用例（含硬链接 inode 断言、"答完/结束后才能删除"的回归，以及
+`test_clear_cache_only_touches_stimuli_cache`：**「清理测试音频缓存」只清 `data/cache`**）；
+#7 `test_prepare_pair_loudness_and_peak`（实测 `ΔLUFS = 0.0000`，断言 ≤ 0.05）+
+`test_stimulus_metadata_matches_written_files` / `test_written_pair_verification_rejects_mismatch`（以落盘为准）；
+#8 `test_question_does_not_leak_bitrate_or_codec` + `test_answer_reveals_both_sides_only_after_answering`；
+#9 `test_result_counts_correct_answers` / `test_result_flags_guessing` / `test_result_statistics_payload` /
+`test_binom_p_value_and_required_n` / `test_row_stats_marks_small_samples_as_undecidable`；
+#12 `test_segment_algo_version_invalidates_cache` / `test_stimuli_algo_version_moves_cache_dir`；
+#13 三条封面流用例；#14 `test_answer_is_final_and_replay_is_idempotent`；
+#15 `test_questions_shuffle_but_keep_identical_stimulus_set` / `test_stimuli_cached_and_reusable`；
+#16 `test_static_assets_are_revalidated`；#17 `test_frontend_volume_slider_is_wired`；
+#18 `test_selection_order_does_not_change_stimulus_set`；#19 `test_concurrent_stimuli_generation_is_identical_to_serial` /
+`test_concurrency_autodetect` / `test_shared_locks_survive_multiple_event_loops`；
+#20 `test_progress_endpoint_reports_generation` / `test_progress_tracking_lifecycle` /
+`test_frontend_prepare_progress_is_wired`；#21 `test_detailed_round_prewarms_short_complement` /
+`test_prewarm_is_detailed_only_and_switchable`；#22 `test_lossless_side_is_bit_identical_across_bitrates` /
+`test_lossless_reference_is_shared_across_bitrates` / `test_sharing_falls_back_when_peak_attenuation_is_needed`。
+**#2（浏览器实操）与 #7 的主观听感已由作者在真机过了一遍（见 §16）；改 `static/` 或改测试音频内容后要重过 #2。**
 
 ## 10. 非目标（维护者红线）
 
@@ -474,16 +468,23 @@ README 的「它不做什么」是同一份清单的**用户口径**（只留用
 # 前置：系统已有 ffmpeg / ffprobe（实测 6.1.1）；本项目不 apt install、不装任何全局包
 make install     # = pip install -r requirements.txt（解释器自动探测，可用 PY= 覆盖）
 make run         # 前台启动（Ctrl+C 停止）；或 make run-bg 后台启动 + make stop 停止
-make test        # 77 项自动化测试（需要 make install-dev）
+make test        # 79 项自动化测试（需要 make install-dev）
 ```
 
 - **解释器**：`Makefile` 的 `PY` 会按「项目内 `.venv` → 作者的 conda 环境 `tin_ear` → `python3` → `python`」
   自动挑选，也可以用 `make run PY=/path/to/python` 覆盖。`HOST`（默认 `0.0.0.0`）与 `PORT`（默认 `8000`）同样可覆盖。
 - **最省事的启动入口**：`python app.py` —— 就是 §16 里的 `__main__` 块，读 `HOST` / `PORT` 环境变量
-  （默认 `0.0.0.0:8000`）、打印访问地址与"0.0.0.0 无认证"的提示，然后 `uvicorn.run(app, …)`。
+  （默认 `0.0.0.0:8000`），然后 `uvicorn.Config(app, …)` + `uvicorn.Server(config).run()`。
   直接传 app 对象而不是 `"app:app"` 字符串：省掉一次模块导入，也避免两个 `FastAPI` 实例。
   **固定单进程**（会话在内存里）。由 `test_python_app_py_entry_point_serves_the_api` 守护 —— 它会真的
-  起子进程、轮询 `/api/library`，所以 README 首推的这条命令不会悄悄坏掉。
+  起子进程、轮询 `/api/library`、并检查启动输出，所以 README 首推的这条命令不会悄悄坏掉。
+- **启动提示只给「能打开的地址」**（`_startup_lines()`）：监听所有网卡（`0.0.0.0` / `::`）时显示
+  `http://localhost:<port>` 并附一句「局域网内其他设备也能打开、界面没有认证」；绑具体网卡时照实显示
+  那个地址（那时 localhost 反而打不开，不能一律写 localhost）。uvicorn 自己那行
+  `Uvicorn running on http://0.0.0.0:…` 打的是**绑定地址**，与提示并排只会让人犹豫该开哪个 ——
+  由 `_drop_uvicorn_bind_banner` 用日志过滤器拦掉；过滤器装在 `uvicorn.Config(...)` **之后**，
+  因为 uvicorn 是在 `Config.__init__` 里做 `dictConfig` 的。提示走 **stderr 且 `flush=True`**：
+  stdout 被重定向时是块缓冲，那行提示会一直压到进程退出才出现（见 §15 的实测）。
 - **公开仓库的可移植性**：README 给出通用 `venv` 路线；`make` 只是作者自用的便捷层，
   任何机器上 `python -m uvicorn app:app` 都能跑起来（只要装了 `requirements.txt` 与系统 ffmpeg）。
 - **安全**：这是本地单用户工具，接口无认证。默认绑 `0.0.0.0` 是为了虚拟机 + 宿主机浏览器访问；
@@ -566,7 +567,8 @@ make test        # 77 项自动化测试（需要 make install-dev）
 
 - **保留 `python app.py` 作为首推启动方式**：README 的"最省事"一节用它，显式 uvicorn 命令与 `make run`
   退居"参数看得见/作者自用"。理由：新用户记不住 `--workers 1` 与 `-m uvicorn app:app` 这一串，
-  而入口本来就在 `__main__` 里；顺带把地址与安全提示打印出来（WSL 场景最需要）。
+  而入口本来就在 `__main__` 里；顺带把地址与安全提示打印出来（WSL 场景最需要），而且打印的是
+  `http://localhost:<port>`、不是绑定地址 —— `0.0.0.0` 并不是一个能打开的地址（见 §12）。
 - **用户可见的名词统一叫「测试音频」**：`stimulus/刺激` 是心理声学的正式术语，但在中文 UI 里第一联想
   是电刺激，读起来怪。只改**面向用户**的文案与错误信息；内部标识（`stimuli/` 目录、
   `STIMULI_ALGO_VERSION`、`_ensure_stimuli`、`STIMULUS_SUBTYPE`）保留 —— `STIMULUS_SUBTYPE` 更是
@@ -584,40 +586,21 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 - `tests/conftest.py`：lavfi 合成音频（声部 + 粉噪 + 动态包络 + 瞬态，35 s / 65 s 两种）；
   `attach_cover_flac()` 造带 `attached_pic` 封面的 FLAC；`stream_types()` 用 ffprobe 看文件里有哪些流；
   `isolated_data` 夹具把 app 的全部数据目录重定向到本测试自己的临时目录；`fast_config` 把题量压到最小让 API 测试秒级完成。
-- `tests/test_pipeline.py`：常量守护、对齐符号与真实 MP3 往返、等响度/峰值、**增益必须是纯线性**（防限幅器）、
-  切片逐采样精确与**切片必须丢掉封面流**、片段选择确定性与不重叠、缓存版本失效、
-  出题乱序（集合恒定 / 顺序变化 / 安慰剂位置打散 / 每档题数）、二项检验与功效阈值、
-  缓存复用计数、WAV 头规范（48 kHz / 2ch / 720000 / 当前 STIMULUS_SUBTYPE，且整数位深的头恰好 44 字节）、
-  **落盘自检与其拒绝路径**（`test_stimulus_metadata_matches_written_files`：把落盘文件重新解码重算
-  LUFS/真峰值，与索引记录比对 ≤ 1e-3 dB，并断言两路字节数相等；`test_written_pair_verification_rejects_mismatch`
-  证明篡改内容/长度不齐时自检真的会抛；`test_stimulus_subtype_lsb_mapping` 守护位深↔量化台阶的换算）、
-  **无损侧共享与其前提**（`test_lossless_side_is_bit_identical_across_bitrates` 验证 delta == 0 时无损侧
-  逐位相同；`test_lossless_reference_is_shared_across_bitrates` 验证每个片段只留一份、安慰剂复用；
-  `test_sharing_falls_back_when_peak_attenuation_is_needed` 把 TARGET_LUFS 压到 -6 强制触发衰减，
-  验证退回每档一份、且 `delta < 0` 的题目绝不吃共享文件）、
-  **选曲顺序不影响题表**（`test_selection_order_does_not_change_stimulus_set`）、
-  **并发与串行产物一致 + 并发数自适应**（`test_concurrent_stimuli_generation_is_identical_to_serial`
-  会比较缓存索引条目数与**解码后的样本**而不是文件字节，理由见 §15 的 `PEAK` chunk 坑）、
-  **进度状态机与过期清理**（`test_progress_tracking_lifecycle` / `test_concurrency_autodetect`）、
-  **共享锁的循环作用域**（`test_shared_locks_survive_multiple_event_loops`：两个 `asyncio.run` 循环里
-  各争用一次同一把锁 —— 这正是 `_loop_scoped_lock` 要防的坑）、
-  **详细模式预热快速补集**（`test_detailed_round_prewarms_short_complement` /
-  `test_prewarm_is_detailed_only_and_switchable`：冷缓存 detailed 报告 `prewarmed >= 1`，
-  接着 short 必须 `generated == 0`；关掉开关后 short 又需要补 1 个）。
-- `tests/test_api.py`：导入与去重（含带封面源的导入）、有损格式拒绝、删除与 409（含"答完全部题目后即可删除"的回归）、
-  题目参数校验、**防泄漏**、`reveal` 只在作答后返回且只含本题、首答即最终与幂等重放、安慰剂两路内容相同、
-  带封面源的端到端出题回归、结果统计（p 值/显著/样本不足/`status` 枚举）与结论文案、
-  **静态资源强制重验证**（`test_static_assets_are_revalidated`）、
-  **试听音量滑条接线**（`test_frontend_volume_slider_is_wired`：`gain → volume → destination`、
-  `/api/start` 报 `target_lufs`）、
-  **「清理测试音频缓存」的作用域**（`test_clear_cache_only_touches_stimuli_cache`：只清 `data/cache`）、
-  **准备进度端点**（`test_progress_endpoint_reports_generation`：未知 token 返回 `found: false`，
-  完成后 `finished/done/total` 正确）、**前端进度条接线**（`test_frontend_prepare_progress_is_wired`）、
-  启动清理、TTL 清理、路径穿越；以及一条特殊的端到端用例
-  **`test_python_app_py_entry_point_serves_the_api`**（守护 README 首推的 `python app.py`）：
-  把 `app.py` 与 `static/` 复制到临时目录再起真子进程（`HOST=127.0.0.1 PORT=<空闲端口>`），
-  轮询 `/api/library` 直到 200 再把进程收掉。**不能**直接在当前工作区起子进程 ——
-  `_bootstrap()` 会清空 `data/tmp`，而那正是 pytest 临时目录所在的地方。
+- `tests/test_pipeline.py`：常量守护、对齐与真实 MP3 往返、等响度/峰值、**增益必须是纯线性**（防限幅器）、
+  切片逐采样精确 + **切片必须丢掉封面流**、片段选择确定性与不重叠、缓存版本失效、出题乱序（集合恒定 /
+  顺序变化 / 安慰剂位置打散 / 每档题数）、二项检验与功效阈值、缓存复用计数、WAV 头规范（48 kHz / 2ch /
+  720000 / 当前 `STIMULUS_SUBTYPE`，整数位深的头恰好 44 字节）、**落盘自检与其拒绝路径**、
+  **无损侧共享的前提与回退**、选曲顺序不影响题表、并发与串行产物一致（比**解码后的样本**，理由见 §15 的
+  `PEAK` 坑）、并发数自适应、进度状态机与过期清理、共享锁的循环作用域、详细模式预热快速补集。
+- `tests/test_api.py`：导入与去重（含带封面源）、有损格式拒绝、删除与 409（含"答完全部题目后即可删除"的
+  回归）、题目参数校验、**防泄漏**、`reveal` 只在作答后返回且只含本题、首答即最终与幂等重放、安慰剂两路
+  内容相同、带封面源的端到端出题、结果统计与结论文案、**静态资源强制重验证**、**试听音量滑条接线**、
+  **「清理测试音频缓存」的作用域**（只清 `data/cache`）、**启动提示与 banner 过滤**（`_startup_lines`
+  按 host 给出能打开的地址；`_drop_uvicorn_bind_banner` 只拦那一行 banner）、**准备进度端点**、
+  **前端进度条接线**、启动清理、TTL 清理、路径穿越；以及那条守护 `python app.py` 的端到端用例
+  （把 `app.py` 与 `static/` 复制到临时目录再起真子进程，轮询 `/api/library` 直到 200 再收掉 ——
+  **不能**在当前工作区起：`_bootstrap()` 会清空 `data/tmp`，而那正是 pytest 临时目录所在处）。
+  两个文件的用例名与它们各自守的验收条目见 §9。
 - `pytest.ini`：`tmp_path_retention_policy = failed` + `tmp_path_retention_count = 1` —— 测试产物落在
   项目内 `data/tmp/`，合成音频一次就有几百 MB，默认策略会留下最近几轮（实测堆到 907 MB）。
   注意 `count = 1` 的含义是"会话级 `tmp_path_factory` 目录保留最近 1 轮"，所以**失败的那一轮**会留下
@@ -633,11 +616,9 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 | MP3 编码到**管道**（无 LAME 头） | 解码得 721152 采样，lag = 1105（23.0 ms）；对齐器可兜住，结果仍 720000 / ΔLUFS = 0 |
 | 每个 (片段, 码率) 组合 | ΔLUFS = 0.0000 LU（32/64/128/320 kbps 均如此）；TARGET_LUFS = -18 → True Peak ≈ -5.3 dBTP；共同衰减 delta = 0（距 -1 dBTP 上限还有 4.3 dB） |
 | 响度目标对比 | -23 LUFS（EBU R128）时真峰值 ≈ -10.3 dBTP，余量 9.3 dB —— 白白浪费动态余量、日常试听偏轻；-18 后余量 4.3 dB |
-| 单个测试音频文件 | **PCM_24：4320044 字节**（4.32 MB；44 字节头 + 采样数据，整数位深无 `PEAK` chunk）。同内容 float32 为 5760088 字节、PCM_16 为 2880044 字节；两路总是完全等长 |
-| 交付位深的量化误差 | PCM_24 实测 `max|落盘 − 内存数组|` = **1.19e-7 = 恰好 1 LSB**（libsndfile 是截断而非四舍五入，故容差取 1.5 LSB 而不是 0.75，实际代码是再加 1e-6 兜底浮点子类型）。折算 ≈ -138 dBFS，距 0.05 dB 的自检容差三个数量级；PCM_16 为 3.05e-5（≈ -101 dBFS） |
-| 缓存体积（无损侧共享**之前**） | detailed（20 真实 + 2 安慰剂、2 个片段）实测 **245.8 MB**/首（**预热功能之前**的数字）；加上预热的快速补集约 **257 MB**/首；46 个 WAV 的档位上限 ≈ 267 MB/首。旧版单片段设计下 detailed 只释放 130271006 字节，已不适用 |
-| 缓存体积（无损侧按内容共享**之后**，float32 交付，实测） | 同素材、同 detailed（含预热 1 对）：**23 个 WAV / 136.4 MB**/首（其中 `seg_*.flac` + meta.json 3.9 MB），比共享前的 253.4 MB **−47.7%**；只跑快速模式 **7 个 WAV / 44.2 MB**/首。WAV = 21 个压缩侧 + 2 份共享无损侧 + 0（安慰剂复用共享文件） |
-| 缓存体积（再改成 PCM_24 交付，实测） | 同上素材：单文件 **4320044 B**（float32 的 5760088 B，**−25.0%**，头恰好 44 字节、无 `PEAK` chunk）；detailed **23 个 WAV / 103.3 MB**/首、只跑快速模式 **34.1 MB**/首；两套阶梯并集上限 ≈ 108 MB/首。**相对最初的 253.4 MB 共 −59.2%**。冷启动 4.3 s、命中缓存 0.009 s —— 落盘自检只多读 2 个文件（+9 ms/题），没有可测的退化 |
+| 单个测试音频文件 | **PCM_24：4320044 字节**（4.32 MB；44 字节头 + 采样数据，整数位深无 `PEAK` chunk）；同内容 float32 为 5760088、PCM_16 为 2880044。两路总是完全等长 |
+| 交付位深的量化误差 | PCM_24 实测「落盘样本 − 内存数组」的最大逐样本差 = **1.19e-7 = 恰好 1 LSB**（libsndfile 是截断而非四舍五入，容差因此取 1.5 LSB + 1e-6 兜底浮点）。≈ -138 dBFS，距 0.05 dB 的自检容差三个数量级；PCM_16 为 3.05e-5（≈ -101 dBFS） |
+| 缓存体积（1 首 65 s 素材、detailed 含预热 1 对；含 `seg_*.flac` 与 meta.json 3.9 MB） | 三次实测的递进：**253.4 MB**（float32，20 对各自一份无损侧）→ **136.4 MB**（无损侧按内容共享，float32，−47.7%）→ **103.3 MB**（再改 PCM_24 交付，**合计 −59.2%**；23 个 WAV = 21 个压缩侧 + 2 份共享无损侧 + 0，安慰剂复用共享文件）。只跑快速模式 44.2 → **34.1 MB**；档位上限（11 档 × 2 片段 + 2 份共享无损侧 = 24 个 WAV）≈ **108 MB/首**。三次的冷启动/命中都在 4.3～4.8 s / 0.004～0.011 s，落盘自检只多读 2 个文件（+9 ms/题） |
 | `/api/start` 首次生成 10 对测试音频（**串行时代**的旧数据，并发行见下） | 7.8 s；命中缓存后 < 0.2 s |
 | `/api/start` 首次 detailed（22 题、20 对真实测试音频 + 2 安慰剂） | **15.8 s**（`generated: 22, reused: 0`）；再开一轮 `generated: 0, reused: 22`，**0.01 s** |
 | 单题生成耗时拆解（24 核机器，65 s 合成源） | **746 ms/题**：`_prepare_pair`（响度+对齐，numpy）462 ms、ffmpeg 编码 163 ms、解码 83 ms、写 2 个 WAV 24 ms、读片段 FLAC 14 ms —— **瓶颈是我们自己的 numpy，不是 ffmpeg** |
@@ -648,6 +629,7 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 | 随机 token 的"包含码率数字"概率 | 16 位 hex、15 个两位窗口 → 含某个指定的两位数概率 **5.74%**（实测 20000 次采样）；这就是那条防泄漏断言原来的假阳性率，已在测试里固定随机源修掉 |
 | 并发冷启动端到端（真 uvicorn + HTTP，1 首 65 s 素材、detailed；**预热功能之前**的实测） | `generated: 22, reused: 0` 用时 **4.0 s**（进度 0→22 正常上报）；同素材第二轮 `generated: 0, reused: 22`；详细→快速补生成 **1** 个（224 kbps 只属快速阶梯）、快速→详细 `0 / 22`；缓存 245.5 MB/首 |
 | 详细模式预热快速补集（同上素材，冷缓存） | detailed：`generated: 22, reused: 0, prewarmed: 1`，用时 **4.4 s**（进度总量 23）；紧接着 short：`generated: 0, reused: 6`，用时 **0.009 s**（预热前这一步是 0.7 s） |
+| `python app.py` 的启动提示 | 必须走 **stderr + `flush=True`**：stdout 被重定向时是块缓冲，实测提示会一直压到进程退出才出现，被 `timeout` / Ctrl+C 打断时**根本看不到**。uvicorn 那行 `Uvicorn running on http://0.0.0.0:…` 是绑定地址，已用日志过滤器拦掉（过滤器装在 `Config()` 之后，免得被它的 `dictConfig` 覆盖） |
 | 依赖 | 全部 wheel（soundfile 自带 libsndfile），无需编译器或系统库 |
 
 > 一个**与交付位深有关的坑**：libsndfile 写 **float32** WAV 时会加一个 `PEAK` chunk，里面带 `timeStamp`
@@ -657,35 +639,31 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 > 隔 1.2 s 两次写入字节完全相同（实测）。测试仍然比**解码后的样本**：那是语义上该比的东西，
 > 而且换成 FLOAT 交付时 `PEAK` 差异又会回来（`test_concurrent_stimuli_generation_is_identical_to_serial`）。
 
-实现期间修掉的五个真问题（都已加测试守护）：
+实现期间修掉的五个真问题（机制见 §6 的两条 ⚠️ 与 §7 的「静态资源强制重验证」，都已加测试守护）：
 
-1. **`-ss` 位置**：输出 seek（`-i` 之后）在 `start=40s` 会输出整段静音，必须用输入 seek。
-2. **对齐精修符号**：`_estimate_lag` 精修阶段的平移方向与负延迟覆盖写反，需与 `_shifted` 保持一致
-   （`aligned[k] = cand[k + lag]`）。
-3. **响度公式**（对应 §6 修正）：若对两路施加"同一个增益"，两路响度差会保持原样而不是归零；
-   正确做法是**各自**按 loudness 增益到目标，再施加**共同**的峰值余量衰减。
-4. **内嵌封面流**（对应 §6 修正）：`-map_metadata -1` 清不掉 `attached_pic` 视频流，切片时必须 `-map 0:a:0`，
-   否则封面帧进入片段、MP3 muxer 试图写 ID3v2 APIC 而被 `-id3v2_version 0` 拒绝 → rc=234。
-   注意该 bug 只在"最佳片段起点 = 0"时触发（起点 > 0 时封面帧落在窗口外）。
-5. **浏览器缓存旧 `app.js` 导致的静默失败**：揭晓改成 `reveal` 之后，旧脚本仍去读 `data.correct_side`，
-   拿到 `undefined` 后在 `undefined.toUpperCase()` 上抛异常；而它抛异常前已经先把「查看答案」按钮
-   `hidden` 掉了，于是用户只看到"按钮消失、页面什么都不显示"。修法三条同时上：
-   `/` 与 `/static/*` 强制重验证（§7）、`index.html` 用 `?v=N` 引用资源、揭晓函数改成**任何分支都显示东西**
-   （拿不到 `reveal` 就提示强制刷新）。由 `test_static_assets_are_revalidated` 守护。
+1. **`-ss` 位置**：输出 seek（`-i` 之后）会输出整段静音，必须用输入 seek。
+2. **对齐精修符号**：精修阶段的平移方向写反，须与 `_shifted` 一致（`aligned[k] = cand[k + lag]`）。
+3. **响度公式**：对两路施加同一个增益不会让响度差归零，必须各自归一后再施加共同的峰值余量衰减。
+4. **内嵌封面流**：三条 ffmpeg 命令都要带 `-map 0:a:0`，否则 rc=234（只在最佳片段起点 = 0 时触发）。
+5. **浏览器缓存旧 `app.js`**：接口改名后旧脚本抛异常，而它抛异常前先把「查看答案」按钮 `hidden` 了，
+   于是用户只看到"点了没反应"。修法是强制重验证 + `?v=N` + 揭晓函数任何分支都显示东西。
    > 教训：凡是"点了按钮但什么都没发生"的交互，函数里都不能有会抛异常的隐式假设。
 
 ## 16. 项目现状（交接摘要）
 
-- **状态**：功能完整可用。`make test` **77 项**全绿（约 1.4 分钟）。
-- **改动历史**：看 `git log --oneline`。最近一轮（缓存顺序无关 + 并发生成 + 进度条 + 术语改「测试音频」+
-  环境配置收敛 + 详细模式预热快速补集 + `python app.py` 一键启动 + 无损侧按内容共享 + 交付位深 FLOAT → PCM_24）之后，README/AGENTS 都已同步；
+- **状态**：功能完整可用。`make test` **79 项**全绿（约 1.4 分钟）。
+- **改动历史**：看 `git log --oneline`。最近几轮依次是：缓存顺序无关 + 并发生成 + 进度条 + 术语改「测试音频」
+  + 环境配置收敛 + 详细模式预热快速补集 + `python app.py` 一键启动 + **无损侧按内容共享**
+  + **交付位深 FLOAT → PCM_24** + **启动提示只给能打开的地址**。README/AGENTS 都已同步；
   历史上修过的真问题都在 §15，不必从提交信息里考古。
 - **关键实测**：每对 ΔLUFS = 0.0000 LU、真峰值 ≈ −5.3 dBTP（−18 LUFS 下）、两路同为 **4,320,044 字节**（无体积泄漏）、
   22 题详细模式**串行 15.8 s / 8 路并发 3.9 s**、缓存复用 0.01 s、测试音频缓存 **103.3 MB/首**
   （含预热；无损侧共享 + PCM_24 之前是 253.4 MB）、
   详细模式顺手预热后**两个方向切换都是 0.01 s**、`POWER_REQUIRED_N = 7`。完整表见 §15。
-- **待人工验证**：验收 #2（浏览器实操，含新的进度条）与 #7 的主观听感；其余 20 条已自动化（对照表见 §9）。
-  验收 #1（安装即跑）现在由 `python app.py` 这条命令覆盖，并有测试真的把子进程起起来探活。
+- **待人工验证**：**无**。验收 #2（浏览器实操，含进度条与改位深后的播放）与 #7 的主观听感都已由作者
+  在真机上过了一遍；其余 20 条由 `make test` 持续守护（对照表见 §9）。验收 #1（安装即跑）现在由
+  `python app.py` 这条命令覆盖，并有测试真的把子进程起起来探活。
+  约定：**改前端（`static/`）或改测试音频内容之后，重新过一遍 #2** —— 那是唯一一条机器替不了的。
 - **已定位并修掉的测试假阳性**：`test_question_does_not_leak_bitrate_or_codec` 曾约每十轮挂一次，
   现象是 `assert '96' not in '47398a8e90e79657'`。根因**不在产品代码**：不透明 token 是随机 16 位 hex，
   15 个两位窗口里出现 `96` 的概率实测 **5.74%**，而那条断言把"token 恰好含码率数字"误判成泄漏
@@ -710,12 +688,11 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
   PCM_16 母版还小 256 倍，等于对源素材仍然无损）加上 24-bit WAV 在 `decodeAudioData` 里少踩坑，
   代价是只省 25% 而不是 50%。想换只改 `STIMULUS_SUBTYPE` 一行，但要连带 bump `STIMULI_ALGO_VERSION`
   并在真机浏览器上过一遍验收 #2。
-- **讨论过但没做的省磁盘方案**（结论：收益不抵代价，别顺手捡起来）：
-  1. **真 MP3 + FLAC 当容器**（压缩侧存真 MP3、无损侧存 FLAC，磁盘可再降一个数量级）：CD 级 CBR 的字节数
-     就是码率（96 kbps × 15 s ÷ 8 = 180,576 B），`Content-Length` 会**直接泄露码率**，与验收 #8 的
-     「两路等长」不变量正面冲突；而且增益得改成「编码前迭代」（实测 1 次迭代残差 0.016 LU、2 次 0.001 LU），
-     浏览器 `decodeAudioData` 对 MP3 编码器延迟的裁剪没有跨浏览器保证（服务端对齐白做，A/B 可能差 23 ms）。
-  2. **给这个优化加一个用户开关**：A 的共享判据是内容而不是设置，本来就没有「关掉」的语义；做成前端开关会把
-     缓存布局变成随客户端偏好变化的东西（换浏览器 / 无痕 / 清 localStorage 都要重算），而「改动后清空全部缓存
-     重建」又是全局且破坏性的（20 首 ≈ 88 s、写 5 GB），粒度也不对 —— 既有先例（`SEGMENT_ALGO_VERSION`）
-     是**逐曲惰性**重算。真要回收，用现成的「清理测试音频缓存」按钮，或加 LRU 上限。
+- **讨论过但没做的省磁盘方案**（收益不抵代价，别顺手捡起来）：
+  1. **真 MP3 + FLAC 当容器**（可再降一个数量级）：CD 级 CBR 的字节数就是码率（96 kbps × 15 s ÷ 8 =
+     180576 B），`Content-Length` 会**直接泄露码率**，与验收 #8 的「两路等长」正面冲突；增益还得改成
+     「编码前迭代」（实测 1 次残差 0.016 LU），且浏览器 `decodeAudioData` 对 MP3 编码器延迟的裁剪没有
+     跨浏览器保证（服务端对齐白做，A/B 可能差 23 ms）。
+  2. **给它加用户开关**：判据是内容而不是设置，本来就没有「关掉」的语义；而且「改动后清空全部缓存重建」
+     是全局破坏性的（20 首 ≈ 88 s、写 5 GB），粒度也不对 —— 既有先例是**逐曲惰性**重算。真要回收，
+     用现成的「清理测试音频缓存」按钮，或加 LRU 上限。
