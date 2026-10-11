@@ -121,7 +121,7 @@ data/
 | 位置 | 是什么 | 怎么清 | 代价 | 典型占用 |
 |---|---|---|---|---|
 | `.pip-cache/` | pip 下载缓存 | `make clean-pip-cache` | 下次 `make install` 要重新下载 | **72 MB** |
-| `data/cache/` | 片段 + 刺激缓存 | `make clean-cache`，或界面上的「清理刺激缓存」按钮 | 下次开测重新生成：短模式约 8 秒、详细 22 题约 16 秒 | **67 MB/首** |
+| `data/cache/` | 片段 + 刺激缓存 | `make clean-cache`，或界面上的「清理刺激缓存」按钮 | 下次开测重新生成：短模式约 8 秒、详细 22 题约 16 秒 | 详细模式跑满约 **245 MB/首**；只跑快速模式约 **70 MB/首** |
 | `data/tmp/` | 上传落盘与 ffmpeg 中间文件的草稿区 | `make clean`，或什么都不做（**后端每次启动自动清空**） | 无 | 平时接近 0；跑过测试可能到几百 MB |
 | `data/session/` | 进行中测试的硬链接 | `make clean`，或 `/api/end` / 重启 | 打断进行中的测试 | 一轮约 60 MB，结束即释放 |
 | `__pycache__/`、`.pytest_cache/` | Python / pytest 运行缓存 | `make clean` | 无 | 共约 400 KB |
@@ -218,6 +218,10 @@ make test    # 59 项，约 1 分钟（需要 make install-dev 装过 pytest/htt
 
 **删不掉音频？** 有进行中的测试在引用它，先结束测试。
 
+**磁盘占用越来越大，怎么清？** 见上面的「想清理磁盘占用怎么办」：`make size` 看占用，
+`make clean-pip-cache` 清 pip 缓存，`make clean-cache`（或界面按钮）清刺激缓存，`make clean` 一次清完可重建项
+（**`data/library/` 里的音频不会被删**）。
+
 ---
 
 ## 非目标
@@ -248,4 +252,6 @@ make test    # 59 项，约 1 分钟（需要 make install-dev 装过 pytest/htt
   （默认只显示"已记录"，答案需手动点）。**改完 `static/` 记得把 `index.html` 里的 `?v=N` 加一。**
 - **数据**：`data/library/` 是你的音频（持久，别删）；`data/cache/` 可随时重建（→ `make clean-cache`）；
   `data/session/`、`data/tmp/` 每次启动自动清空。
+- **磁盘清理**：`make size` 看占用，`make clean-pip-cache` / `make clean-cache` / `make clean` 分级清理
+  （详见「想清理磁盘占用怎么办」）；`make clean` 的删除列表是固定的，永远不会碰 `data/library/`。
 
