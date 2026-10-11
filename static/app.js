@@ -26,6 +26,7 @@ const state = {
 const audio = {
   ctx: null,
   gain: null,
+  volume: null,
   source: null,
   buffers: { a: null, b: null },
   side: null,
@@ -36,6 +37,33 @@ const audio = {
 };
 
 const FADE = 0.005; // 5 ms 淡入淡出
+const VOLUME_FLOOR_DB = -40; // 滑条到底 = 静音
+const VOLUME_STEP_DB = 2; // 键盘 ±2 dB
+
+/* 试听音量：监听级增益节点，A/B 共用同一个节点，所以不可能只把一边调响。
+   刺激文件本身已归一到后端常量 TARGET_LUFS（见 /api/start 的 target_lufs），
+   所以默认 0 dB 就是"文件原样播放"。 */
+function volumeDb() {
+  const slider = $('volume-input');
+  return slider ? Number(slider.value) : 0;
+}
+
+function applyVolume() {
+  const db = volumeDb();
+  const label = db <= VOLUME_FLOOR_DB ? '静音' : `${db} dB`;
+  if ($('volume-label')) $('volume-label').textContent = label;
+  if (audio.volume) {
+    audio.volume.gain.value = db <= VOLUME_FLOOR_DB ? 0 : Math.pow(10, db / 20);
+  }
+}
+
+function nudgeVolume(deltaDb) {
+  const slider = $('volume-input');
+  if (!slider) return;
+  const next = Math.min(0, Math.max(VOLUME_FLOOR_DB, Number(slider.value) + deltaDb));
+  slider.value = String(next);
+  applyVolume();
+}
 
 /* ------------------------------------------------------------------ 工具 */
 
@@ -239,9 +267,13 @@ function ensureAudioContext() {
   if (!audio.ctx) {
     const Ctor = window.AudioContext || window.webkitAudioContext;
     audio.ctx = new Ctor({ sampleRate: 48000, latencyHint: 'playback' });
+    // 链路：source → gain（5 ms 淡入淡出，0..1）→ volume（用户滑条，A/B 共用）→ 输出
     audio.gain = audio.ctx.createGain();
     audio.gain.gain.value = 0;
-    audio.gain.connect(audio.ctx.destination);
+    audio.volume = audio.ctx.createGain();
+    audio.gain.connect(audio.volume);
+    audio.volume.connect(audio.ctx.destination);
+    applyVolume();
   }
   if (Math.abs(audio.ctx.sampleRate - 48000) > 1 && !state.sampleRateWarned) {
     state.sampleRateWarned = true;
@@ -513,6 +545,12 @@ async function startTest() {
       stimuli ? `刺激就绪：新生成 ${stimuli.generated} 个，复用 ${stimuli.reused} 个。` : '',
       'ok'
     );
+    // 让用户知道文件本身已经归一到多少 LUFS（这样"要不要调滑条"心里有数）
+    if ($('volume-hint') && data.target_lufs !== undefined) {
+      $('volume-hint').textContent =
+        `刺激已等响归一化到 ${data.target_lufs} LUFS（A/B 同步）；滑条只影响试听响度，不影响判定`;
+    }
+    applyVolume();
     await loadQuestion(0);
   } catch (error) {
     setStatus('prepare-status', `准备失败：${error.message}`, 'error');
@@ -747,6 +785,7 @@ function wireEvents() {
 
   $('btn-play-a').addEventListener('click', () => toggleSide('a'));
   $('btn-play-b').addEventListener('click', () => toggleSide('b'));
+  $('volume-input').addEventListener('input', applyVolume);
   $('btn-reveal').addEventListener('click', revealAnswer);
   $('btn-next').addEventListener('click', advance);
   document.querySelectorAll('.answer').forEach((button) => {
@@ -759,6 +798,11 @@ function wireEvents() {
     if ($('view-test').classList.contains('hidden')) return;
     if (event.target && ['INPUT', 'TEXTAREA'].includes(event.target.tagName)) return;
     const key = event.key.toLowerCase();
+    if (event.key === 'ArrowUp' || event.key === 'ArrowDown') { // 试听音量 ±2 dB
+      event.preventDefault();
+      nudgeVolume(event.key === 'ArrowUp' ? VOLUME_STEP_DB : -VOLUME_STEP_DB);
+      return;
+    }
     if (state.answered) {
       if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); advance(); }
       return;

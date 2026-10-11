@@ -64,9 +64,10 @@ SEGMENT_STEP_SECONDS = 5
 SEGMENT_SAMPLES = SAMPLE_RATE * SEGMENT_SECONDS  # 720000 = 恰好 625 个 MP3 帧
 SEGMENT_FADE_SECONDS = 0.02
 SEGMENT_ALGO_VERSION = 1
-STIMULI_ALGO_VERSION = 1  # 与 SEGMENT_ALGO_VERSION 同步 bump
+STIMULI_ALGO_VERSION = 2  # 刺激缓存版本：任何改变刺激内容的常量/参数都要 bump
+#                           （v2：TARGET_LUFS 由 -23 提到 -18 LUFS）
 
-TARGET_LUFS = -23.0
+TARGET_LUFS = -18.0
 TRUE_PEAK_DBTP = -1.0
 MAX_LUFS_DIFF_LU = 0.05  # 测试断言用（协议上限 0.3）
 TRUE_PEAK_SLACK_DB = 0.05  # 浮点容差
@@ -1350,7 +1351,7 @@ async def api_start(request: StartRequest) -> dict:
             role_tokens[role] = token
         state.tokens[question.question_id] = role_tokens
     SESSIONS[session_id] = state
-    return {**state.to_public(), "stimuli": stimuli}
+    return {**state.to_public(), "stimuli": stimuli, "target_lufs": TARGET_LUFS}
 
 
 @app.get("/api/question")

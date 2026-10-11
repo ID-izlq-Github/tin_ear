@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TinEar · 本地音频盲测</title>
-<link rel="stylesheet" href="/static/style.css?v=6">
+<link rel="stylesheet" href="/static/style.css?v=7">
 </head>
 <body>
 <header class="top">
@@ -64,6 +64,12 @@
 
       <p class="hint center">点击 A / B 试听，切换时播放位置保持不变；作答后会停留在本题，可查看答案再进入下一题</p>
 
+      <div class="volume">
+        <label for="volume-input">试听音量 <span id="volume-label">0 dB</span></label>
+        <input id="volume-input" type="range" min="-40" max="0" step="1" value="0">
+        <span id="volume-hint" class="hint">A/B 完全同步，只影响试听响度，不影响判定</span>
+      </div>
+
       <div class="answers">
         <button class="btn answer" data-choice="a">A 更好</button>
         <button class="btn answer" data-choice="b">B 更好</button>
@@ -108,6 +114,6 @@
   </section>
 </main>
 
-<script src="/static/app.js?v=6"></script>
+<script src="/static/app.js?v=7"></script>
 </body>
 </html>

@@ -34,7 +34,7 @@ def test_spec_constants_match_agents_md():
     assert app_module.SAMPLE_RATE == 48000
     assert app_module.CHANNELS == 2
     assert app_module.SEGMENT_SECONDS == 15
-    assert app_module.TARGET_LUFS == -23.0
+    assert app_module.TARGET_LUFS == -18.0
     assert app_module.TRUE_PEAK_DBTP == -1.0
     assert app_module.SHORT_TEST_BITRATES == [48, 96, 160, 224, 320]
     assert app_module.DETAILED_TEST_BITRATES == [32, 48, 64, 80, 96, 128, 160, 192, 256, 320]
@@ -113,8 +113,12 @@ def test_prepare_pair_loudness_and_peak(segment_pair):
     assert info["lufs_diff"] <= app_module.MAX_LUFS_DIFF_LU, info
     assert info["true_peak_db"] <= app_module.TRUE_PEAK_DBTP + app_module.TRUE_PEAK_SLACK_DB, info
     for value in info["lufs"].values():
-        assert app_module.TARGET_LUFS - 6.0 <= value <= app_module.TARGET_LUFS + 1e-6, info
+        # 紧贴上界：说明响度目标真的达到了（没有被共同峰值衰减吃掉）
+        assert app_module.TARGET_LUFS - 0.5 <= value <= app_module.TARGET_LUFS + 1e-6, info
     assert info["gain_db"]["common_delta"] <= 0.0
+    # 我们的合成素材波峰因数约 12.7 dB，-18 LUFS 下真峰值约 -5.3 dBTP：
+    # 距离 -1 dBTP 上限还应有 ≥2 dB 余量，否则说明响度定得太高、动态段落会被压回。
+    assert info["true_peak_db"] <= app_module.TRUE_PEAK_DBTP - 2.0, info
 
 
 def test_gain_is_pure_linear_no_limiter(segment_pair):

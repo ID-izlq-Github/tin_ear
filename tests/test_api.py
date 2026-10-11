@@ -532,6 +532,31 @@ def test_static_assets_are_revalidated(client):
     assert "reveal.sides" in script.text
 
 
+def test_frontend_volume_slider_is_wired(client, fast_config, long_source):
+    """试听音量滑条：监听级增益节点，A/B 共用，且后端把 TARGET_LUFS 告诉前端。
+
+    音量只能整体调（同一个 GainNode），所以不存在"只把某一边调响"的可能；
+    文件本身已归一到 TARGET_LUFS，滑条默认 0 dB 就是原样播放。
+    """
+    index = client.get("/").text
+    assert 'id="volume-input"' in index
+    assert 'type="range"' in index
+
+    script = client.get("/static/app.js").text
+    assert "audio.volume" in script, "要有独立的音量节点"
+    assert "volume-input" in script, "滑条要接线"
+    assert "applyVolume" in script
+    # 淡入淡出节点与音量节点串成一条链，而不是各自直接连到 destination
+    assert "audio.gain.connect(audio.volume)" in script
+    assert "audio.volume.connect(audio.ctx.destination)" in script
+    assert "audio.gain.connect(audio.ctx.destination)" not in script
+
+    # 后端要把归一化目标告诉前端，界面上那句提示才不会写死数字
+    item = upload(client, long_source)
+    session = start_session(client, [item["audio_id"]])
+    assert session["target_lufs"] == app_module.TARGET_LUFS == -18.0
+
+
 def test_result_handles_unanswered_questions(client, fast_config, long_source):
     item = upload(client, long_source)
     session_id = start_session(client, [item["audio_id"]])["session_id"]

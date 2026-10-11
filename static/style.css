@@ -110,6 +110,18 @@ main { max-width: 760px; margin: 0 auto; padding: 12px 16px 48px; }
 .ab-btn.playing .state { color: var(--ok); }
 
 .answers { display: grid; gap: 10px; margin-top: 18px; }
+
+.volume {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border);
+  font-size: 14px; color: var(--muted);
+}
+.volume label { white-space: nowrap; }
+.volume #volume-label { color: var(--fg); font-variant-numeric: tabular-nums; }
+.volume input[type="range"] {
+  flex: 1 1 160px; min-width: 120px; accent-color: var(--accent); cursor: pointer;
+}
+.volume #volume-hint { flex: 1 1 100%; margin: 0; font-size: 12px; }
 .answer { padding: 18px; font-size: 17px; }
 .answer:hover:not(:disabled) { border-color: var(--accent); }
 .answer.selected { border-color: var(--ok); background: #1c3229; }
