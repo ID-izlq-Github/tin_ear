@@ -389,7 +389,7 @@ A/B 下面有**试听音量滑条**（−40 dB…0 dB，到底 = 静音；`↑/�
 21. **详细模式预热快速补集**：冷缓存跑详细 → 响应里 `prewarmed >= 1`；紧接着切快速 →
     `generated == 0`（预热前这一步要补 1 对、约 0.7 s）。`PREWARM_SHORT_COMPLEMENT = False` 可关闭。
 
-自动化覆盖对照（`make test`，71 项）：#1 见 README 的安装/运行两行命令；#3/#4/#5 由 `test_api.py`
+自动化覆盖对照（`make test`，71 项）：#1 见 README「快速开始」（`python app.py`）；#3/#4/#5 由 `test_api.py`
 的导入与拒绝用例覆盖；#6/#10/#11 由清理用例覆盖（含硬链接 inode 断言、"答完/结束后才能删除"的回归用例，
 以及 `test_clear_cache_only_touches_stimuli_cache`：**「清理测试音频缓存」只清 `data/cache`**，
 不碰 `data/tmp` / `data/session` / `data/library`）；
@@ -462,11 +462,11 @@ make test        # 71 项自动化测试（需要 make install-dev）
   用 pip 自己的默认位置；`make install/run/test` 都会打印选中的解释器，避免"静默用了别的环境"。
 - **清理**（`data/library/` 里的音频永不删除，由 `make clean` 的固定目标列表保证）：
   `make size` 看占用；`make clean-cache` 清 `data/cache/`（快速模式跑满约 70 MB/首、重生成约 1 s；
-  详细模式 245.8 MB/首、重生成约 4 s）；
+  详细模式 245.8 MB/首、重生成约 4 s；含预热的快速补集则约 257 MB/首）；
   `make clean` 清所有可重建项（含 `data/session`、`data/tmp`、`__pycache__`、`.pytest_cache`、`data/server.log`，
   以及旧版本遗留的 `.pip-cache/`）。
   不要用 `git clean -xfd`：`data/` 在 `.gitignore` 里，会把用户导入的音频一起删掉。
-- **非 Makefile 安装（README 方式一：venv / Windows）**：清理就是直接删同名目录（`_bootstrap` 下次启动会重建），
+- **非 Makefile 安装（README「最省事」/ 方式一：venv / Windows）**：清理就是直接删同名目录（`_bootstrap` 下次启动会重建），
   跑测试用 `TMPDIR="$PWD/data/tmp" python -m pytest -q`（PowerShell 用 `$env:TMPDIR`）——
   README「想清理磁盘占用怎么办」与「测试」两节给了 macOS/Linux 与 PowerShell 的可复制命令。
 - 依赖全是 wheel（`soundfile` 自带 libsndfile），不需要编译器或系统库。
@@ -586,7 +586,7 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 | 每个 (片段, 码率) 组合 | ΔLUFS = 0.0000 LU（32/64/128/320 kbps 均如此）；TARGET_LUFS = -18 → True Peak ≈ -5.3 dBTP；共同衰减 delta = 0（距 -1 dBTP 上限还有 4.3 dB） |
 | 响度目标对比 | -23 LUFS（EBU R128）时真峰值 ≈ -10.3 dBTP，余量 9.3 dB —— 白白浪费动态余量、日常试听偏轻；-18 后余量 4.3 dB |
 | 单个测试音频文件 | 5760088 字节（5.76 MB + WAV 头），A/B 完全等长 |
-| 缓存体积 | detailed（20 真实 + 2 安慰剂、2 个片段）实测 **245.8 MB**/首；两套阶梯并集 11 档 × 2 片段 + 2 安慰剂 ≈ **267 MB**/首（46 个 WAV + 片段）。旧版单片段设计下 detailed 只释放 130271006 字节，已不适用 |
+| 缓存体积 | detailed（20 真实 + 2 安慰剂、2 个片段）实测 **245.8 MB**/首（**预热功能之前**的数字）；加上预热的快速补集约 **257 MB**/首；两套阶梯并集 11 档 × 2 片段 + 2 安慰剂 ≈ **267 MB**/首（46 个 WAV + 片段）。旧版单片段设计下 detailed 只释放 130271006 字节，已不适用 |
 | `/api/start` 首次生成 10 对测试音频（**串行时代**的旧数据，并发行见下） | 7.8 s；命中缓存后 < 0.2 s |
 | `/api/start` 首次 detailed（22 题、20 对真实测试音频 + 2 安慰剂） | **15.8 s**（`generated: 22, reused: 0`）；再开一轮 `generated: 0, reused: 22`，**0.01 s** |
 | 单题生成耗时拆解（24 核机器，65 s 合成源） | **746 ms/题**：`_prepare_pair`（响度+对齐，numpy）462 ms、ffmpeg 编码 163 ms、解码 83 ms、写 2 个 WAV 24 ms、读片段 FLAC 14 ms —— **瓶颈是我们自己的 numpy，不是 ffmpeg** |
@@ -624,10 +624,11 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 ## 16. 项目现状（交接摘要）
 
 - **状态**：功能完整可用。`make test` **71 项**全绿（约 1 分钟）。
-- **改动历史**：看 `git log --oneline`（最近一次：缓存顺序无关 + 并发生成 + 进度条 + 术语改「测试音频」
-  + 环境配置与文档收敛）。历史上修过的真问题都在 §15，不必从提交信息里考古。
+- **改动历史**：看 `git log --oneline`。最近一轮（缓存顺序无关 + 并发生成 + 进度条 + 术语改「测试音频」+
+  环境配置收敛 + 详细模式预热快速补集 + `python app.py` 一键启动）之后，README/AGENTS 都已同步；
+  历史上修过的真问题都在 §15，不必从提交信息里考古。
 - **关键实测**：每对 ΔLUFS = 0.0000 LU、真峰值 ≈ −5.3 dBTP（−18 LUFS 下）、两路各 5760088 字节（无体积泄漏）、
-  22 题详细模式**串行 15.8 s / 8 路并发 3.9 s**、缓存复用 0.01 s、测试音频缓存 245.8 MB/首、
+  22 题详细模式**串行 15.8 s / 8 路并发 3.9 s**、缓存复用 0.01 s、测试音频缓存 245.8 MB/首（含预热 257 MB）、
   详细模式顺手预热后**两个方向切换都是 0.01 s**、`POWER_REQUIRED_N = 7`。完整表见 §15。
 - **待人工验证**：验收 #2（浏览器实操，含新的进度条）与 #7 的主观听感；其余 20 条已自动化（对照表见 §9）。
   验收 #1（安装即跑）现在由 `python app.py` 这条命令覆盖，并有测试真的把子进程起起来探活。
