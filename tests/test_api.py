@@ -696,6 +696,32 @@ def test_clear_cache_endpoint(client, fast_config, long_source):
     assert cache_wavs(audio_id)
 
 
+def test_clear_cache_only_touches_stimuli_cache(client, fast_config, long_source):
+    """"清理刺激缓存"只管 data/cache，不碰 data/tmp / data/session / data/library。
+
+    data/tmp 是上传落盘与 ffmpeg 中间文件的草稿区，由后端每次启动自动清空（见 _bootstrap）；
+    界面上按钮显示的 MB 数就是这里返回的 cache_bytes，两者不要混。
+    """
+    item = upload(client, long_source)
+    audio_id = item["audio_id"]
+    session_id = start_session(client, [audio_id])["session_id"]
+
+    leftover = app_module.TMP_DIR / "junk_left_from_a_test_run.bin"
+    leftover.write_bytes(b"x" * 1024)
+    session_dir = app_module.SESSION_DIR / session_id
+
+    listing = client.get("/api/library").json()
+    assert listing["cache_bytes"] > 0
+    assert listing["tmp_bytes"] >= 1024  # 界面会同时显示这两个数字
+
+    freed = client.delete("/api/cache").json()["freed_bytes"]
+    assert freed >= listing["cache_bytes"] - 1  # 释放的就是按钮上显示的那个数
+
+    assert leftover.exists(), "临时文件的清理不是这个按钮的职责"
+    assert session_dir.is_dir(), "进行中的会话不能被误删"
+    assert (app_module.LIBRARY_DIR / f"{audio_id}.flac").exists()
+
+
 def test_static_index_is_served(client):
     response = client.get("/")
     assert response.status_code == 200

@@ -1263,7 +1263,14 @@ async def index() -> FileResponse:
 
 @app.get("/api/library")
 async def api_library() -> dict:
-    return {"items": _library()["items"], "cache_bytes": _dir_size(CACHE_DIR)}
+    # cache_bytes = 界面「清理刺激缓存」按钮会释放的量（data/cache：片段 + 刺激）
+    # tmp_bytes   = 草稿区占用（data/tmp：上传落盘 / ffmpeg 中间文件），后端每次启动自动清空，
+    #               不由那个按钮负责 —— 分开报，界面才不会让人误以为按钮没生效。
+    return {
+        "items": _library()["items"],
+        "cache_bytes": _dir_size(CACHE_DIR),
+        "tmp_bytes": _dir_size(TMP_DIR),
+    }
 
 
 @app.post("/api/library/upload")

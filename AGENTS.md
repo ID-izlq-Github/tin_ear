@@ -54,6 +54,7 @@ tinear/
   requirements.txt        # 运行期依赖（正常安装只需要这一份）
   requirements-dev.txt    # 测试依赖（pytest / httpx）
   requirements.lock.txt   # 作者机器实测通过的环境快照（pip list --format=freeze），仅供参考
+  pytest.ini              # 测试产物保留策略（只留失败那一轮的临时目录）
   Makefile                # install / install-dev / run / run-bg / stop / test
                           # clean-cache / clean-pip-cache / clean / size
   LICENSE                 # MIT
@@ -216,10 +217,10 @@ n=5 需 4/5（p=0.045）、n=10 需 7/10（p=0.020）。详细模式 20 道真�
 ## 7. API
 
 ```
-GET    /api/library                       → { items, cache_bytes }
+GET    /api/library                       → { items, cache_bytes, tmp_bytes }
 POST   /api/library/upload        form-data: files   → { results: [{filename,status,audio_id,reason}] }
 DELETE /api/library/{audio_id}            → 200 { deleted, freed_bytes } / 404 / 409（被**尚未完成**的测试引用）
-DELETE /api/cache                         → 清空片段与刺激缓存 { freed_bytes }
+DELETE /api/cache                         → 清空片段与刺激缓存 data/cache { freed_bytes }
 
 POST /api/start                   body: { audio_ids, mode }
                                   → { session_id, total, mode, stimuli: {generated, reused} }
@@ -278,6 +279,8 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 页面里有两条提示：格式/时长要求；**选曲建议**（优先配器复杂、动态强烈的曲目，安静单调的段落即使在
 32 kbps 下也可能听不出差别）。模式标签写明题量与每档题数（快速 6 题 · 每档 1 题 / 详细 22 题 · 每档 2 题）。
 开始测试时的状态栏会报告本轮刺激是"新生成 N 个 / 复用 M 个"。
+「清理刺激缓存（N MB）」按钮下面还有一行小字，把两个占用分开写清楚（避免让人以为按钮没生效）：
+`刺激缓存 X MB（上面那个按钮释放的就是它；下次测试重新生成）· 临时文件 Y KB（上传/编码草稿，后端每次启动自动清空，不需要手动管）`。
 
 **测试**：题号/总数、进度条、A/B 播放按钮（循环、5 ms 淡入淡出）、三选项（A 更好 / B 更好 / 听不出）。不显示文件名、码率、编码器、时长。
 
@@ -323,8 +326,10 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 16. `/` 与 `/static/*` 返回 `Cache-Control: no-cache, must-revalidate`，页面用 `?v=N` 引用 JS/CSS ——
     浏览器不会拿旧脚本去调新接口（见 §15 第 5 条）。
 
-自动化覆盖对照（`make test`，59 项）：#1 见 README 的安装/运行两行命令；#3/#4/#5 由 `test_api.py`
-的导入与拒绝用例覆盖；#6/#10/#11 由清理用例覆盖（含硬链接 inode 断言，以及"答完/结束后才能删除"的回归用例）；
+自动化覆盖对照（`make test`，60 项）：#1 见 README 的安装/运行两行命令；#3/#4/#5 由 `test_api.py`
+的导入与拒绝用例覆盖；#6/#10/#11 由清理用例覆盖（含硬链接 inode 断言、"答完/结束后才能删除"的回归用例，
+以及 `test_clear_cache_only_touches_stimuli_cache`：**「清理刺激缓存」只清 `data/cache`**，
+不碰 `data/tmp` / `data/session` / `data/library`）；
 #7 的实测值为 `ΔLUFS = 0.0000`（远严于 0.3，`test_prepare_pair_loudness_and_peak` 断言 ≤ 0.05）；#8 由
 `test_question_does_not_leak_bitrate_or_codec` 覆盖（键集合白名单 + 禁用子串 + 两路 `Content-Length` 相等），
 "作答后才揭晓"由 `test_answer_reveals_both_sides_only_after_answering` 覆盖；#9 由
@@ -370,7 +375,7 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 # 前置：系统已有 ffmpeg / ffprobe（实测 6.1.1）；本项目不 apt install、不装任何全局包
 make install     # = pip install -r requirements.txt（解释器自动探测，可用 PY= 覆盖）
 make run         # 前台启动（Ctrl+C 停止）；或 make run-bg 后台启动 + make stop 停止
-make test        # 59 项自动化测试（需要 make install-dev）
+make test        # 60 项自动化测试（需要 make install-dev）
 ```
 
 - **解释器**：`Makefile` 的 `PY` 会按「项目内 `.venv` → 作者的 conda 环境 `tin_ear` → `python3` → `python`」
@@ -431,7 +436,11 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 - `tests/test_api.py`：导入与去重（含带封面源的导入）、有损格式拒绝、删除与 409（含"答完全部题目后即可删除"的回归）、
   题目参数校验、**防泄漏**、`reveal` 只在作答后返回且只含本题、首答即最终与幂等重放、安慰剂两路内容相同、
   带封面源的端到端出题回归、结果统计（p 值/显著/样本不足/`status` 枚举）与结论文案、
-  **静态资源强制重验证**（`test_static_assets_are_revalidated`）、启动清理、TTL 清理、路径穿越。
+  **静态资源强制重验证**（`test_static_assets_are_revalidated`）、
+  **「清理刺激缓存」的作用域**（`test_clear_cache_only_touches_stimuli_cache`：只清 `data/cache`）、
+  启动清理、TTL 清理、路径穿越。
+- `pytest.ini`：`tmp_path_retention_policy = failed` —— 测试产物落在项目内 `data/tmp/`，
+  合成音频一次就有几百 MB，默认策略会留下最近几轮（实测堆到 907 MB），改成"只留失败那一轮"。
 - 测试产物全部落在 `data/tmp/`（受 `TMPDIR` 约束），不写系统 temp 或用户目录。
 
 ## 15. 实测数据与实现记录（ffmpeg 6.1.1-3ubuntu5 / Python 3.12.15）

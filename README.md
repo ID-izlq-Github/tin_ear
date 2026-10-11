@@ -118,14 +118,23 @@ data/
 
 `make size` 先看一眼各自占了多少，然后按需（**`data/library/` 里的音频任何命令都不会动**）：
 
-| 命令 | 清掉什么 | 代价 | 典型占用 |
-|---|---|---|---|
-| `make clean-pip-cache` | `.pip-cache/`（pip 下载缓存，项目内） | 下次 `make install` 要重新下载依赖（约 70 MB） | **72 MB** |
-| `make clean-cache` | `data/cache/`（片段 + 刺激缓存） | 下次开测重新生成：短模式约 8 秒、详细 22 题约 16 秒 | **67 MB/首** |
-| `make clean` | 上面两项 + `data/session/`、`data/tmp/`、`__pycache__/`、`.pytest_cache/`、`data/server.log` | 同上，外加会打断进行中的测试（建议先 `make stop`） | 全部可重建项 |
-| `make stop` | 后台服务（`data/server.log`、`data/server.pid` 保留） | —— | 日志很小 |
+| 位置 | 是什么 | 怎么清 | 代价 | 典型占用 |
+|---|---|---|---|---|
+| `.pip-cache/` | pip 下载缓存 | `make clean-pip-cache` | 下次 `make install` 要重新下载 | **72 MB** |
+| `data/cache/` | 片段 + 刺激缓存 | `make clean-cache`，或界面上的「清理刺激缓存」按钮 | 下次开测重新生成：短模式约 8 秒、详细 22 题约 16 秒 | **67 MB/首** |
+| `data/tmp/` | 上传落盘与 ffmpeg 中间文件的草稿区 | `make clean`，或什么都不做（**后端每次启动自动清空**） | 无 | 平时接近 0；跑过测试可能到几百 MB |
+| `data/session/` | 进行中测试的硬链接 | `make clean`，或 `/api/end` / 重启 | 打断进行中的测试 | 一轮约 60 MB，结束即释放 |
+| `__pycache__/`、`.pytest_cache/` | Python / pytest 运行缓存 | `make clean` | 无 | 共约 400 KB |
+| `data/library/` | **你自己导入的音频母版** | ❌ 别删（要删请用界面上的「删除」按钮，会同时清掉它的缓存） | 重新导入 | 42 MB/首 |
 
-- 不想用 Makefile 就直接删：`rm -rf .pip-cache data/cache`（等价，这两个目录纯粹是可重建的缓存）。
+一次清完可重建的：`make clean`（= 上表里除 `data/library/` 之外的全部；服务在跑时会提醒你先 `make stop`）。
+
+- **界面上那个「清理刺激缓存（67.1 MB）」按钮只管 `data/cache/`** —— 括号里的数字就是它要释放的量，
+  它不碰 `data/tmp`（草稿区）和 `data/library`（你的音频）。页面下方那行小字会同时显示两个数字：
+  「刺激缓存 67.1 MB（按钮释放的就是它）· 临时文件 8 KB（后端每次启动自动清空）」。
+- `make test` 会在 `data/tmp/` 下留合成音频的临时目录，所以项目里加了 `pytest.ini`：
+  `tmp_path_retention_policy = failed` —— 测试全过时自动删掉，只在失败时保留一轮供排查。
+- 不想用 Makefile 就直接删：`rm -rf .pip-cache data/cache`（这两个目录纯粹是可重建的缓存）。
 - 等价于"清 pip 缓存"的原始命令是 `PIP_CACHE_DIR="$PWD/.pip-cache" python -m pip cache purge`，但直接 `rm -rf` 更省事。
 - **注意别清错地方**：本项目通过 `PIP_CACHE_DIR` 把 pip 缓存顶到项目内，所以你手动跑 `pip install`（不经过
   `make`）时缓存会写到全局 `~/.cache/pip`。要清全局的用 `python -m pip cache purge`（不带 `PIP_CACHE_DIR`）——

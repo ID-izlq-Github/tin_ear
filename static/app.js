@@ -19,6 +19,8 @@ const state = {
   bufferCache: new Map(),
   busy: false,
   sampleRateWarned: false,
+  cacheBytes: 0,
+  tmpBytes: 0,
 };
 
 const audio = {
@@ -366,6 +368,7 @@ async function loadLibrary() {
   const data = await api('/api/library');
   state.items = data.items || [];
   state.cacheBytes = data.cache_bytes || 0;
+  state.tmpBytes = data.tmp_bytes || 0;
   for (const audioId of [...state.selected]) {
     if (!state.items.some((item) => item.audio_id === audioId)) state.selected.delete(audioId);
   }
@@ -413,6 +416,9 @@ function renderLibrary() {
   $('btn-start').disabled = state.selected.size < 1;
   $('btn-clear-cache').textContent = `清理刺激缓存（${formatSize(cacheBytes)}）`;
   $('btn-clear-cache').disabled = cacheBytes === 0;
+  $('cache-info').textContent =
+    `刺激缓存 ${formatSize(cacheBytes)}（上面那个按钮释放的就是它；下次测试重新生成）`
+    + ` · 临时文件 ${formatSize(state.tmpBytes || 0)}（上传/编码草稿，后端每次启动自动清空，不需要手动管）`;
 }
 
 function toggleSelect(audioId, checked) {
