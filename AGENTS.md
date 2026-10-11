@@ -66,8 +66,8 @@ TRUE_PEAK_DBTP = -1.0
 SHORT_TEST_BITRATES = [48, 96, 160, 224, 320]
 DETAILED_TEST_BITRATES = [32, 48, 64, 80, 96, 128, 160, 192, 256, 320]
 
-SHORT_TEST_TOTAL = 6       # 5 真实 + 1 安慰剂
-DETAILED_TEST_TOTAL = 12   # 10 真实 + 2 安慰剂
+SHORT_TEST_TOTAL = 6       # 5 真实 + 1 安慰剂（快速模式：每档 1 题）
+DETAILED_TEST_TOTAL = 22   # 20 真实 + 2 安慰剂（详细模式：每档 2 题）
 
 SEGMENT_ALGO_VERSION = 1
 SESSION_TTL_SECONDS = 7200
@@ -97,13 +97,21 @@ ALIGN_MAX_LAG, ALIGN_REFINE_SPAN = 8192, 64
 STIMULUS_SUBTYPE = "FLOAT"         # 回退项 "PCM_24"
 FFMPEG_CONCURRENCY = 2
 MIN_SOURCE_SAMPLE_RATE, MIN_SOURCE_SECONDS = 44100, 30
-SHUFFLE_QUESTIONS = False          # 默认保留「码率从低到高」
+SHUFFLE_ALL_QUESTIONS = True       # 真实题与安慰剂题统一打乱，位置不携带任何信息
 PLACEBO_SAME_SEGMENT = True        # 默认：安慰剂 = 同一片段的两份无损拷贝
 RESULT_BRACKETS = [("≤96 kbps"), ("128–192 kbps"), ("≥224 kbps")]
+CHANCE_LEVEL = 1.0 / 3.0           # 三选一（A/B/听不出）的瞎猜基线，不是 1/2
+ALPHA = 0.05                       # 单侧精确二项检验的显著性水平
+POWER_TARGET, P1_FOR_POWER = 0.8, 0.8   # 算"每档需要多少题"用的功效与备择听出率
+MIN_N_FOR_SIGNIFICANCE = 3         # 少于 3 题任何结果都无法判定（n=1 的最小 p 就是 1/3）
 ```
 
 注意：`SHORT_TEST_BITRATES` 并非 `DETAILED_TEST_BITRATES` 的子集（**224 kbps 只在 short 档**），
 两条阶梯并集共 11 档，这也是刺激缓存的档位上限。
+
+统计口径（实测 `POWER_REQUIRED_N = 7`）：单侧精确二项检验 `P(X ≥ k | p = 1/3)`，每档题数与临界答对数 ——
+n=1 任何结果都不可能显著（最小 p = 1/3）、n=3 需 3/3（p=0.037）、n=4 需 4/4（p=0.012）、
+n=5 需 4/5（p=0.045）、n=10 需 7/10（p=0.020）。详细模式 20 道真实题下分档 n = 10 / 6 / 4。
 
 ## 5. 存储规则
 
@@ -113,7 +121,8 @@ RESULT_BRACKETS = [("≤96 kbps"), ("128–192 kbps"), ("≥224 kbps")]
 - `session/` 与 `tmp/` 临时。后端启动清空（`data/library/`、`data/cache/` 保留）。
   `/api/start` 时清理超 `SESSION_TTL_SECONDS` 的旧目录与无主目录。`/api/end` 删除当前 session 目录。
 - `session/` 内是 `cache/` 刺激文件的**硬链接**（跨文件系统时回退为复制），因此
-  `/api/end` 只删链接，刺激缓存仍在，重复测试几乎瞬时开始。
+  `/api/end` 只删链接，刺激缓存仍在，重复测试几乎瞬时开始。`/api/start` 的响应里报告本轮
+  `stimuli: {generated, reused}`，前端把它显示出来，"到底复用没复用"不再靠猜。
 - `tempfile.tempdir` 指向 `data/tmp/`：不写系统 temp 或用户目录。
 - `SESSIONS: dict[str, SessionState]` 保存活动会话。重启即丢。
 
@@ -122,9 +131,9 @@ RESULT_BRACKETS = [("≤96 kbps"), ("128–192 kbps"), ("≥224 kbps")]
 ### 导入到库
 
 1. `ffprobe` 检查：必须无损编码（`pcm_*`、`flac`、`alac`、`wavpack`、`tta`），采样率 ≥ 44100 Hz，时长 ≥ 30 秒。
-2. 转 48 kHz / 立体声 / FLAC：
+2. 转 48 kHz / 立体声 / FLAC（**必须显式 `-map 0:a:0`**，见下面的封面流坑）：
    ```
-   ffmpeg -y -i input -ar 48000 -ac 2 -c:a flac output.flac
+   ffmpeg -y -i input -map 0:a:0 -map_metadata -1 -ar 48000 -ac 2 -c:a flac output.flac
    ```
 3. 对**转换后的 FLAC** 取 SHA-256 去重（而非源文件）：同一段音频的 WAV 与 AIFF 会被识别为同一内容。
    `audio_id = sha256[:16]`。
@@ -152,6 +161,14 @@ RESULT_BRACKETS = [("≤96 kbps"), ("128–192 kbps"), ("≥224 kbps")]
 > 整段数字静音；放在 `-i` 之前（输入 seek，默认 `-accurate_seek`）则逐采样精确。由
 > `test_cut_segment_is_sample_accurate` 守护。
 
+> ⚠️ 实测坑（已修）：切片命令**必须带 `-map 0:a:0`**。带内嵌封面（`attached_pic` 视频流）的源在
+> `start=0` 时会把封面帧一起写进 `seg_*.flac`（`start>0` 时封面帧落在窗口外，反而看不出来），
+> 于是一路传到 MP3 编码步骤、muxer 想写 ID3v2 APIC 而我们的 `-idv2_version 0` 关掉了 ID3v2 →
+> `rc=234 Attached pictures were requested, but the ID3v2 header is disabled`，`/api/start` 直接 500。
+> 同一个 `-map 0:a:0` 也已加到导入转码与 MP3 编码两处，由
+> `test_cut_segment_drops_attached_picture` / `test_import_strips_attached_picture` /
+> `test_start_with_cover_art_source_builds_stimuli` 守护。
+
 ### 生成刺激
 
 - 缓存在 `cache/<audio_id>/stimuli/v{STIMULI_ALGO_VERSION}/`，键 = `seg<i>_<bitrate>k`（安慰剂为 `seg<i>_p<seg>`）；
@@ -159,7 +176,7 @@ RESULT_BRACKETS = [("≤96 kbps"), ("128–192 kbps"), ("≥224 kbps")]
 - 无损版：片段 FLAC 解码为 48 kHz float32 母版。
 - 压缩版（CBR，且写文件以便 LAME/Xing gapless 头生效）：
   ```
-  ffmpeg -y -i seg.flac -map_metadata -1 -id3v2_version 0 -write_id3v1 0 -write_xing 1 \
+  ffmpeg -y -i seg.flac -map 0:a:0 -map_metadata -1 -id3v2_version 0 -write_id3v1 0 -write_xing 1 \
          -c:a libmp3lame -b:a <bitrate>k temp.mp3
   ffmpeg -v error -i temp.mp3 -f f32le -ac 2 -ar 48000 -      # 直接管道进 numpy
   ```
@@ -177,10 +194,15 @@ RESULT_BRACKETS = [("≤96 kbps"), ("128–192 kbps"), ("≥224 kbps")]
 ### 题目生成
 
 - 模式：`short` 或 `detailed`；真实题数 = `SHORT_TEST_TOTAL-1` / `DETAILED_TEST_TOTAL-2`，安慰剂 1 / 2 道。
-- 码率按 `ladder[i % len(ladder)]` 循环取（升序 → 简单到难）：把题量常量调大即自动变成多次重复，
-  无需改 API（这是弥补"逐档单题"局限的入口）。
-- 从选中音频池轮流取（round-robin），每首第 k 次出场在 `seg_0/seg_1` 间交替；`(segment, bitrate)` 优先取未用过的组合。
-- 安慰剂题追加在末尾；默认 A、B 是**同一片段的两份无损拷贝**（内容完全相同），否则"听不出"不是唯一正确答案。
+- 码率按 `ladder[i % len(ladder)]` 循环取：把题量常量调大即自动变成多次重复（`detailed` 默认 20 道 → 每档 2 题），
+  无需改 API。
+- 出题顺序：先按上面的规则把真实题与安慰剂题**建好**（`(segment, bitrate)` 组合优先取未用过的，
+  这样每轮用到的刺激集合完全一致 → 缓存必然全部复用），然后**对整张题表 `rng.shuffle`**
+  （`SHUFFLE_ALL_QUESTIONS = True`），最后统一重编号 `index` / `question_id`。
+  真实题与安慰剂题一起打乱："第几题"既不能预判码率高低，也不能预判哪几题是无差异的，
+  逼着人每题都真听（否则无脑按"听不出"会把真实题全部答错）。
+- 从选中音频池轮流取（round-robin），每首第 k 次出场在 `seg_0/seg_1` 间交替。
+- 安慰剂题的 A、B 默认是**同一片段的两份无损拷贝**（内容完全相同），否则"听不出"不是唯一正确答案。
 - 每题随机 `lossless_is_a`；题目仅存内存。
 - `/api/start` 一次性准备好全部题目的刺激并硬链接进 session 目录 —— 会话自包含，之后删库不影响进行中的测试。
 
@@ -192,9 +214,11 @@ POST   /api/library/upload        form-data: files   → { results: [{filename,s
 DELETE /api/library/{audio_id}            → 200 { deleted, freed_bytes } / 404 / 409（被**尚未完成**的测试引用）
 DELETE /api/cache                         → 清空片段与刺激缓存 { freed_bytes }
 
-POST /api/start                   body: { audio_ids, mode } → { session_id, total, mode }
+POST /api/start                   body: { audio_ids, mode }
+                                  → { session_id, total, mode, stimuli: {generated, reused} }
 GET  /api/question?session_id=&index=       → 仅 { index, total, question_id, url_a, url_b }
 POST /api/answer                  body: { session_id, question_id, choice, reaction_ms }
+                                  → { ok, index, next_index, done, accepted, reveal }
 GET  /api/result?session_id=
 POST /api/end                     body: { session_id }
 
@@ -211,13 +235,27 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 
 其他约定：
 
-- `/api/answer` 的 `choice ∈ {a, b, tie}`，`reaction_ms` 从**题目渲染时刻**起算；同题重复提交幂等覆盖。
-  返回 `{ ok, index, next_index, done, correct_side }`：`correct_side ∈ {"a","b",null}`（`null` = 安慰剂题），
-  **仅作答后**才返回，而且整条链路始终不返回码率（验收 #8 成立）。
+- `/api/answer` 的 `choice ∈ {a, b, tie}`，`reaction_ms` 从**题目渲染时刻**起算。**首答即最终**：
+  同题重复提交时，选项相同 → 幂等回放同样的响应；选项不同 → `accepted: false`、`reveal: null`，不改分也不泄漏答案。
+- 返回 `{ ok, index, next_index, done, accepted, reveal }`。`reveal` **仅在首答（或同选项重放）时**非 null：
+  ```
+  "reveal": {
+    "placebo": false,                 # 安慰剂题：A/B 都是无损
+    "correct_side": "a",              # {"a","b"}，安慰剂题为 null
+    "same_segment": false,            # 安慰剂且 A/B 是同一份文件 → true
+    "sides": { "a": {"kind": "lossless", "bitrate": null},
+               "b": {"kind": "mp3",      "bitrate": 96} }
+  }
+  ```
+  也就是说：**未作答的题目与音频接口始终零泄漏**（验收 #8），只有作答之后才揭晓本题两侧的具体身份。
 - 删除库音频只在存在**尚未完成**（`len(answers) < len(questions)`）且引用它的会话时返回 409；
   答完全部题目或 `/api/end` 之后即可删除。
 - 判定：真实题选中无损侧为正确，选 `tie` 记为"未听出"（不正确）；安慰剂题选 `tie` 才是正确。
-- 结果给逐档统计 + `≤96 / 128–192 / ≥224 kbps` 分档聚合 + Wilson 95% 区间；逐档只有单题时前端标注"样本不足"。
+- 结果统计：两层都用**单侧精确二项检验**（H0 = `CHANCE_LEVEL` = 1/3，`alpha` = 0.05），Wilson 区间降级为
+  描述性；每行给 `p_value / significant / note`，顶层给 `overall`（全部真实题）、`chance_level`、`alpha`、
+  `power_required_n`（当前口径下 = 7）。`note` 三态：`样本不足（n<3，无法判定）` / `显著高于瞎猜基线` /
+  `与瞎猜基线无显著差异`。`n < MIN_N_FOR_SIGNIFICANCE` 时 `significant` 恒为 false
+  （n=1 的最小 p 就是 1/3，结构上不可能显著）。
 - `/api/start` 会校验：`mode ∈ {short, detailed}`、`audio_ids` 去重后 1～3 个且都存在；参数不合法 400，音频不存在 404。
 
 ## 8. 前端
@@ -225,16 +263,25 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 单页三视图：
 
 **库管理**：列表、导入、删除、checkbox 选素材（1～3）、模式选择、开始测试。
+页面里有两条提示：格式/时长要求；**选曲建议**（优先配器复杂、动态强烈的曲目，安静单调的段落即使在
+32 kbps 下也可能听不出差别）。模式标签写明题量与每档题数（快速 6 题 · 每档 1 题 / 详细 22 题 · 每档 2 题）。
+开始测试时的状态栏会报告本轮刺激是"新生成 N 个 / 复用 M 个"。
 
 **测试**：题号/总数、进度条、A/B 播放按钮（循环、5 ms 淡入淡出）、三选项（A 更好 / B 更好 / 听不出）。不显示文件名、码率、编码器、时长。
 
 **作答后停留在本题**（不自动跳题）：高亮已选项、其余变暗，显示「已记录：X 更好」，并提供
 「查看答案」（**可选**手动揭晓，默认不自动揭晓以免对后续题产生反馈偏置）与「下一题 →」（末题为「查看结果 →」）。
+点「查看答案」会显示**两侧的具体身份**，例如 `A：无损 / B：MP3 96 kbps —— 无损在 B（正确答案：B 更好）。✘ 你选错了`；
+安慰剂题显示 `A：无损 / B：无损（同一片段的两份拷贝）—— 安慰剂题，正确答案是「听不出」`。
+若出现同一题改选项的请求（正常 UI 不会发生），提示"本题已作答（首答即最终），本次修改已忽略"。
 音频未载入完不允许作答，保证 `reaction_ms` 有效。
 键盘：`1/2/3` 作答、`A/B/空格` 切换试听、回车或空格进入下一题。
 离开测试页、点「再测一次」、或关闭标签页（`sendBeacon`）时都会调用 `/api/end`，不会留下"进行中"的引用。
 
-**结果**：码率 × 正确率表、安慰剂“听不出”比例、文字结论、再测一次 / 返回库。
+**结果**：分档表（首行「全部真实题」= `overall`）列为 `题数 / 答对 / 正确率 / 95% 置信区间 / p 值 / 判定`，
+逐档明细表同列 + 平均反应；下面是安慰剂"听不出"比例与文字结论。另有一段统计口径说明：
+**瞎猜基线是 1/3（不是 50%）**、p 是单侧精确二项检验、每档 < 3 题无法判定、达到 80% 功效约需每档
+`power_required_n` 题。再测一次 / 返回库。
 
 深色背景，大按钮，移动端可用，不做花哨动效。
 
@@ -247,18 +294,27 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 5. 重复导入同 hash 被识别，不重复入库。
 6. 删除库音频时同时删除 `cache/<audio_id>/`。
 7. 每题 A/B 响度差 ≤ 0.3 LU。
-8. 前端请求看不到码率 / 编码器。
-9. 结果页正确率、安慰剂统计正确。
+8. **作答之前**的任何前端请求都看不到码率 / 编码器 / 文件名 / 是否安慰剂；作答之后 `/api/answer`
+   才揭晓**本题**两侧的具体身份（无损 / MP3 xx kbps）。
+9. 结果页正确率、安慰剂统计、p 值与"样本不足"判定正确。
 10. 后端重启清空 `data/session/`，保留 `data/library/`。
 11. `/api/end` 后 session 目录被删。
 12. 改 `SEGMENT_ALGO_VERSION` 后 cache 失效重算。
+13. 带内嵌封面的源可以正常导入并完成出题（不再 rc=234）。
+14. 首答即最终：改了选项不改分、不揭晓答案；同选项重复提交幂等。
+15. 出题顺序每轮随机（含安慰剂），而每轮用到的刺激集合完全一致（缓存必然复用）。
 
-自动化覆盖对照（`make test`，49 项）：#1 见 README 的安装/运行两行命令；#3/#4/#5 由 `test_api.py`
+自动化覆盖对照（`make test`，58 项）：#1 见 README 的安装/运行两行命令；#3/#4/#5 由 `test_api.py`
 的导入与拒绝用例覆盖；#6/#10/#11 由清理用例覆盖（含硬链接 inode 断言，以及"答完/结束后才能删除"的回归用例）；
 #7 的实测值为 `ΔLUFS = 0.0000`（远严于 0.3，`test_prepare_pair_loudness_and_peak` 断言 ≤ 0.05）；#8 由
-`test_question_does_not_leak_bitrate_or_codec` 覆盖（键集合白名单 + 禁用子串 + 两路 `Content-Length` 相等）；
-#9 由 `test_result_counts_correct_answers` / `test_result_flags_guessing` 用手算期望值覆盖；
-#12 由 `test_segment_algo_version_invalidates_cache` / `test_stimuli_algo_version_moves_cache_dir` 覆盖。
+`test_question_does_not_leak_bitrate_or_codec` 覆盖（键集合白名单 + 禁用子串 + 两路 `Content-Length` 相等），
+"作答后才揭晓"由 `test_answer_reveals_both_sides_only_after_answering` 覆盖；#9 由
+`test_result_counts_correct_answers` / `test_result_flags_guessing` / `test_result_statistics_payload` /
+`test_binom_p_value_and_required_n` / `test_row_stats_marks_small_samples_as_undecidable` 覆盖；
+#12 由 `test_segment_algo_version_invalidates_cache` / `test_stimuli_algo_version_moves_cache_dir` 覆盖；
+#13 由 `test_cut_segment_drops_attached_picture` / `test_import_strips_attached_picture` /
+`test_start_with_cover_art_source_builds_stimuli` 覆盖；#14 由 `test_answer_is_final_and_replay_is_idempotent`
+覆盖；#15 由 `test_questions_shuffle_but_keep_identical_stimulus_set` / `test_stimuli_cached_and_reusable` 覆盖。
 **只有 #2（Windows 浏览器实操）与 #7 的主观听感需要人来点一遍。**
 
 ## 10. 非目标
@@ -294,7 +350,7 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 # ffmpeg / ffprobe 用系统已有的 6.1.1，本项目不 apt install、不装任何全局包
 make install     # = pip install -r requirements.txt，装进本项目专用 conda 环境 tin_ear
 make run         # 前台启动（Ctrl+C 停止）；或 make run-bg 后台启动 + make stop 停止
-make test        # 49 项自动化测试
+make test        # 58 项自动化测试
 ```
 
 - pip 缓存与临时文件都留在项目内（`.pip-cache/`、`data/tmp/`），不写系统 temp、`~/.cache`，
@@ -312,11 +368,20 @@ make test        # 49 项自动化测试
 - **配对独立响度增益 + 共同峰值衰减**（而不是"各自归一化 + 限幅压峰"）：响度差恒为 0，且全程零非线性，
   不给低码率题额外线索。
 - 刺激持久缓存 + session 硬链接：重复测试不再重算（原设计每轮重算约 130 MB 且测完即丢）。
-- 不透明 token：URL 与响应都不泄漏码率 / 编码器 / 是否安慰剂。
+- 不透明 token：URL 与响应都不泄漏码率 / 编码器 / 是否安慰剂；**作答之后**才在 `/api/answer` 里揭晓本题两侧身份
+  （为了"看清楚刚才听的是什么"），揭晓只针对已作答的本题，不会泄漏后面的题目。
 - 安慰剂题 = 同一片段的两份无损拷贝：专门检测"听到了不存在的差异"。
+- 出题**全表乱序**（含安慰剂）：位置不携带信息，逼着每题都真听；同时先建题再打乱，
+  保证每轮 (片段, 码率) 集合不变 → 缓存 100% 复用。
 - 不用 librosa：依赖重，ffmpeg + numpy + scipy 足够。
-- 单档 n=1 的统计局限：默认题量下逐档正确率只有 0 / 100%，因此结论以**分档** Wilson 区间为准；
-  要真实统计功效就把 `SHORT_TEST_TOTAL` / `DETAILED_TEST_TOTAL` 调大（阶梯会循环重复）。
+- **统计口径用 1/3 而不是 1/2**：三选一（A 更好 / B 更好 / 听不出）的瞎猜基线是 1/3；
+  显著性判定用**单侧精确二项检验**（小样本下 Wilson 区间只能当描述性参考），
+  并明确"每档 < 3 题无法判定"（n=1 的最小 p 就是 1/3，结构上不可能显著）。
+  要让结论变硬就把 `SHORT_TEST_TOTAL` / `DETAILED_TEST_TOTAL` 调大（阶梯会循环重复）；
+  达到 80% 功效约需每档 7 题（由 `_required_n()` 算出并显示在结果页）。
+- 作答**首答即最终**：否则"先点听不出 → 看揭晓码率 → 改成正解"就能刷分。
+- ffmpeg 的所有转码/切片/编码命令都显式 `-map 0:a:0`：内嵌封面是独立的 `attached_pic` 视频流，
+  一旦混进片段就会让 MP3 编码以 rc=234 失败（详见 §6）。
 
 ## 14. 测试
 
@@ -326,12 +391,15 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 ```
 
 - `tests/conftest.py`：lavfi 合成音频（声部 + 粉噪 + 动态包络 + 瞬态，35 s / 65 s 两种）；
+  `attach_cover_flac()` 造带 `attached_pic` 封面的 FLAC；`stream_types()` 用 ffprobe 看文件里有哪些流；
   `isolated_data` 夹具把 app 的全部数据目录重定向到本测试自己的临时目录；`fast_config` 把题量压到最小让 API 测试秒级完成。
 - `tests/test_pipeline.py`：常量守护、对齐符号与真实 MP3 往返、等响度/峰值、**增益必须是纯线性**（防限幅器）、
-  切片逐采样精确、片段选择确定性与不重叠、缓存版本失效、WAV 头规范（48 kHz / 2ch / 720000 / FLOAT）。
-- `tests/test_api.py`：导入与去重、有损格式拒绝、删除与 409（含"答完全部题目后即可删除"的回归）、
-  题目参数校验、**防泄漏**、`correct_side` 只在作答后返回且不含码率、安慰剂两路内容相同、作答幂等、
-  结果统计与结论文案、启动清理、TTL 清理、路径穿越。
+  切片逐采样精确与**切片必须丢掉封面流**、片段选择确定性与不重叠、缓存版本失效、
+  出题乱序（集合恒定 / 顺序变化 / 安慰剂位置打散 / 每档题数）、二项检验与功效阈值、
+  缓存复用计数、WAV 头规范（48 kHz / 2ch / 720000 / FLOAT）。
+- `tests/test_api.py`：导入与去重（含带封面源的导入）、有损格式拒绝、删除与 409（含"答完全部题目后即可删除"的回归）、
+  题目参数校验、**防泄漏**、`reveal` 只在作答后返回且只含本题、首答即最终与幂等重放、安慰剂两路内容相同、
+  带封面源的端到端出题回归、结果统计（p 值/显著/样本不足）与结论文案、启动清理、TTL 清理、路径穿越。
 - 测试产物全部落在 `data/tmp/`（受 `TMPDIR` 约束），不写系统 temp 或用户目录。
 
 ## 15. 实测数据与实现记录（ffmpeg 6.1.1-3ubuntu5 / Python 3.12.15）
@@ -343,14 +411,20 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 | MP3 编码到**管道**（无 LAME 头） | 解码得 721152 采样，lag = 1105（23.0 ms）；对齐器可兜住，结果仍 720000 / ΔLUFS = 0 |
 | 每对刺激 | ΔLUFS = 0.0000 LU（32/64/128/320 kbps 均如此）；True Peak ≈ -10.3 dBTP；共同衰减 delta = 0 |
 | 单个刺激文件 | 5760088 字节（5.76 MB + WAV 头），A/B 完全等长 |
-| 缓存体积 | 每首最多 2 段 × (11 档 + 1 安慰剂) × 5.76 MB ≈ 130 MB（实测一次 detailed 后释放 130271006 字节） |
+| 缓存体积 | 单段跑满 11 档 ≈ 130 MB（实测一次旧 detailed 后释放 130271006 字节）；新 detailed（20 真实 + 2 安慰剂、2 个片段全用上）实测 **245.8 MB**/首 |
 | `/api/start` 首次生成 10 对刺激 | 7.8 s；命中缓存后 < 0.2 s |
+| `/api/start` 首次 detailed（22 题、20 对真实刺激 + 2 安慰剂） | **15.8 s**（`generated: 22, reused: 0`）；再开一轮 `generated: 0, reused: 22`，**0.01 s** |
+| 带内嵌封面的源（复现 rc=234） | 未加 `-map 0:a:0` 时 `ffmpeg` 返回 rc=234 + `Attached pictures were requested, but the ID3v2 header is disabled`；加上后三步全部 rc=0 |
+| 统计口径实测 | `POWER_REQUIRED_N = 7`；20/20 的精确 p = 2.9e-10（`p<0.001`）；22 题一轮的安慰剂位置实测出现过 [0, 17]（即被正确打散） |
 | 依赖 | 全部 wheel（soundfile 自带 libsndfile），无需编译器或系统库 |
 
-实现期间修掉的三个真问题（都已加测试守护）：
+实现期间修掉的四个真问题（都已加测试守护）：
 
 1. **`-ss` 位置**：输出 seek（`-i` 之后）在 `start=40s` 会输出整段静音，必须用输入 seek。
 2. **对齐精修符号**：`_estimate_lag` 精修阶段的平移方向与负延迟覆盖写反，需与 `_shifted` 保持一致
    （`aligned[k] = cand[k + lag]`）。
 3. **响度公式**（对应 §6 修正）：若对两路施加"同一个增益"，两路响度差会保持原样而不是归零；
    正确做法是**各自**按 loudness 增益到目标，再施加**共同**的峰值余量衰减。
+4. **内嵌封面流**（对应 §6 修正）：`-map_metadata -1` 清不掉 `attached_pic` 视频流，切片时必须 `-map 0:a:0`，
+   否则封面帧进入片段、MP3 muxer 试图写 ID3v2 APIC 而被 `-id3v2_version 0` 拒绝 → rc=234。
+   注意该 bug 只在"最佳片段起点 = 0"时触发（起点 > 0 时封面帧落在窗口外）。
