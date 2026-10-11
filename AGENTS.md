@@ -54,7 +54,8 @@ tinear/
   requirements.txt        # 运行期依赖（正常安装只需要这一份）
   requirements-dev.txt    # 测试依赖（pytest / httpx）
   requirements.lock.txt   # 作者机器实测通过的环境快照（pip list --format=freeze），仅供参考
-  Makefile                # install / install-dev / run / run-bg / stop / test / clean-cache
+  Makefile                # install / install-dev / run / run-bg / stop / test
+                          # clean-cache / clean-pip-cache / clean / size
   LICENSE                 # MIT
   README.md               # 面向使用者
   AGENTS.md               # 本文件，面向维护者
@@ -380,6 +381,11 @@ make test        # 59 项自动化测试（需要 make install-dev）
   共享/不可信网络请用 `HOST=127.0.0.1` 或自行加反代与鉴权。
 - pip 缓存与临时文件都留在项目内（`.pip-cache/`、`data/tmp/`），不写系统 temp、`~/.cache`，
   也不动 `base` 或其他项目的 conda 环境。
+- **清理**（`data/library/` 里的音频永不删除，由 `make clean` 的固定目标列表保证）：
+  `make size` 看占用；`make clean-pip-cache` 清 `.pip-cache/`（实测 72 MB）；
+  `make clean-cache` 清 `data/cache/`（实测 67 MB/首，短模式重生成约 8 s）；
+  `make clean` 清所有可重建项（含 `data/session`、`data/tmp`、`__pycache__`、`.pytest_cache`、`data/server.log`）。
+  不要用 `git clean -xfd`：`data/` 在 `.gitignore` 里，会把用户导入的音频一起删掉。
 - 依赖全是 wheel（`soundfile` 自带 libsndfile），不需要编译器或系统库。
 
 测试注意：关 Windows 音效增强、Dolby、EQ、空间音频；系统音量固定；WSL 不出声，用宿主机浏览器访问 localhost 播放。

@@ -114,6 +114,25 @@ data/
 - 测试进行中点「清理刺激缓存」是安全的：session 里是硬链接，已载入的音频照常播放；
   只是那轮结束后 session 目录会临时占用约 60 MB，结束测试即释放。
 
+### 想清理磁盘占用怎么办
+
+`make size` 先看一眼各自占了多少，然后按需（**`data/library/` 里的音频任何命令都不会动**）：
+
+| 命令 | 清掉什么 | 代价 | 典型占用 |
+|---|---|---|---|
+| `make clean-pip-cache` | `.pip-cache/`（pip 下载缓存，项目内） | 下次 `make install` 要重新下载依赖（约 70 MB） | **72 MB** |
+| `make clean-cache` | `data/cache/`（片段 + 刺激缓存） | 下次开测重新生成：短模式约 8 秒、详细 22 题约 16 秒 | **67 MB/首** |
+| `make clean` | 上面两项 + `data/session/`、`data/tmp/`、`__pycache__/`、`.pytest_cache/`、`data/server.log` | 同上，外加会打断进行中的测试（建议先 `make stop`） | 全部可重建项 |
+| `make stop` | 后台服务（`data/server.log`、`data/server.pid` 保留） | —— | 日志很小 |
+
+- 不想用 Makefile 就直接删：`rm -rf .pip-cache data/cache`（等价，这两个目录纯粹是可重建的缓存）。
+- 等价于"清 pip 缓存"的原始命令是 `PIP_CACHE_DIR="$PWD/.pip-cache" python -m pip cache purge`，但直接 `rm -rf` 更省事。
+- **注意别清错地方**：本项目通过 `PIP_CACHE_DIR` 把 pip 缓存顶到项目内，所以你手动跑 `pip install`（不经过
+  `make`）时缓存会写到全局 `~/.cache/pip`。要清全局的用 `python -m pip cache purge`（不带 `PIP_CACHE_DIR`）——
+  但那会一并清掉其他项目的缓存，本项目不需要这么做。
+- **也不要图省事用 `git clean -xfd`**：`data/`、`.pip-cache/` 都在 `.gitignore` 里，它会把 `data/library/`
+  （你自己导入的音频母版）一起删掉。要清理请用上面的 `make` 目标。
+
 ---
 
 ## 设计要点（为什么结果可信）

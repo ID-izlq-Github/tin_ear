@@ -10,7 +10,7 @@ LOG := $(PROJ)/data/server.log
 export PIP_CACHE_DIR := $(PROJ)/.pip-cache
 export TMPDIR := $(PROJ)/data/tmp
 
-.PHONY: help install install-dev run run-bg stop test clean-cache
+.PHONY: help install install-dev run run-bg stop test clean-cache clean-pip-cache clean size
 
 help:
 	@echo "make install     安装运行期依赖（默认装进 conda 环境 tin_ear；可用 PY= 指定解释器）"
@@ -19,7 +19,12 @@ help:
 	@echo "make run-bg      后台启动，日志 data/server.log"
 	@echo "make stop        停止后台启动的实例"
 	@echo "make test        跑自动化测试（约 1 分钟）"
-	@echo "make clean-cache 清空片段与刺激缓存 data/cache"
+	@echo ""
+	@echo "清理（data/library/ 里的音频永远不动）："
+	@echo "make clean-cache     清空刺激缓存 data/cache（下次测试重新生成，短模式约 8 秒）"
+	@echo "make clean-pip-cache 清空项目内 pip 下载缓存 .pip-cache"
+	@echo "make clean           上面两项 + data/session、data/tmp、__pycache__、.pytest_cache"
+	@echo "make size            看看各自占了多少"
 	@echo ""
 	@echo "当前解释器：$(PY)"
 	@echo "可覆盖的变量：PY=/path/to/python  HOST=127.0.0.1  PORT=8000"
@@ -61,3 +66,27 @@ test:
 
 clean-cache:
 	rm -rf "$(PROJ)/data/cache"
+	@echo "已清空刺激缓存 data/cache（库内音频未动，下次测试会重新生成）"
+
+clean-pip-cache:
+	rm -rf "$(PIP_CACHE_DIR)"
+	@echo "已清空项目内 pip 下载缓存 $(PIP_CACHE_DIR)（只是下次 pip install 要重新下载）"
+
+# 可重建的一切；data/library/ 永远不动
+clean:
+	@if [ -f "$(PID)" ] && kill -0 "$$(cat $(PID))" 2>/dev/null; then \
+		echo "⚠️  服务还在跑（pid $$(cat $(PID))），清理 data/session 会让进行中的测试失效；建议先 make stop"; \
+	fi
+	rm -rf "$(PROJ)/data/cache" "$(PROJ)/data/session" "$(PROJ)/data/tmp" \
+	       "$(PROJ)/data/server.log" "$(PROJ)/data/server.pid" \
+	       "$(PIP_CACHE_DIR)" "$(PROJ)/.pytest_cache"
+	find "$(PROJ)" -name __pycache__ -type d -prune -exec rm -rf {} +
+	@mkdir -p "$(PROJ)/data/session" "$(PROJ)/data/tmp"
+	@echo "已清理可重建的缓存（data/library 未动，仍有 $$(ls -1 "$(PROJ)/data/library"/*.flac 2>/dev/null | wc -l) 个音频文件）"
+
+size:
+	@du -sh "$(PROJ)/data/library" "$(PROJ)/data/cache" "$(PROJ)/data/tmp" \
+	       "$(PROJ)/data/session" "$(PIP_CACHE_DIR)" 2>/dev/null
+	@find "$(PROJ)" -name __pycache__ -type d -prune -exec du -sh {} + 2>/dev/null
+	@echo "--- 合计 ---"
+	@du -sh "$(PROJ)" 2>/dev/null
