@@ -108,10 +108,10 @@ ALIGN_REFINE_SPAN = 64
 #   PCM_16  2,880,044 B（-50%），量化噪声底 ≈ -101 dBFS（= CD 精度）。
 # 对照：32 kbps MP3 的伪影在 -40 dBFS 上下，所以 24 与 16 bit 都不可能成为线索；
 # 选 24 而不是 16 是为了不动"参考侧"的精度，也是为了 24-bit WAV 在浏览器里少踩坑。
-# 换这个常量必须 bump STIMULI_ALGO_VERSION（内容变了），并重跑 §15 的体积/自检数字。
+# 换这个常量必须 bump STIMULI_ALGO_VERSION（内容变了），并重跑 MEASUREMENTS.md 的体积/自检数字。
 STIMULUS_SUBTYPE = "PCM_24"
 STIMULUS_BITS = {"FLOAT": 32, "PCM_24": 24, "PCM_16": 16}
-STIMULI_CONCURRENCY_MAX = 8  # 单题生成实测 ~0.70 s，8 路之后基本饱和（见 AGENTS.md §15）
+STIMULI_CONCURRENCY_MAX = 8  # 单题生成实测 ~0.70 s，8 路之后基本饱和（见 MEASUREMENTS.md）
 
 
 def _detect_cpu_count() -> int:
@@ -1809,7 +1809,7 @@ if __name__ == "__main__":  # pragma: no cover
     _host = os.environ.get("HOST", "0.0.0.0")
     _port = int(os.environ.get("PORT", "8000"))
     # 走 stderr 且 flush：uvicorn 的日志也在 stderr，两者顺序才正确；而且 stdout 被重定向时是块缓冲的，
-    # 那行提示会一直压到进程退出才出现（被 Ctrl+C 打断时甚至看不到）—— 见 §15 的实测记录。
+    # 那行提示会一直压到进程退出才出现（被 Ctrl+C 打断时甚至看不到）—— 见 MEASUREMENTS.md 的实测记录。
     for _line in _startup_lines(_host, _port):
         print(_line, file=sys.stderr, flush=True)
 
