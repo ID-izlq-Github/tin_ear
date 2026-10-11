@@ -1,3 +1,7 @@
+# 作者机器上实测通过的完整环境快照（python -m pip list --format=freeze 的输出）。
+# 仅供参考 / 复现问题用；正常安装请使用 requirements.txt。
+# 例：python -m pip install -r requirements.lock.txt
+Pygments==2.21.0
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
@@ -12,12 +16,11 @@ idna==3.20
 iniconfig==2.3.1
 numpy==2.5.3
 opentelemetry-api==1.45.1
-packaging @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_packaging_1785888127/work
+packaging==26.3
 pluggy==1.6.0
 pycparser==3.11
 pydantic==2.14.0
 pydantic_core==2.50.0
-Pygments==2.21.0
 pyloudnorm==0.2.0
 pytest==9.1.1
 python-multipart==0.0.32

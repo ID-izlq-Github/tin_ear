@@ -1,5 +1,19 @@
+# 运行时数据（音频库、片段/刺激缓存、会话、临时文件）全部留在项目内，不入库
 data/
 .pip-cache/
+
+# Python
 __pycache__/
 *.pyc
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
 .pytest_cache/
+.ruff_cache/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store

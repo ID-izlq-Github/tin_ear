@@ -6,45 +6,61 @@ A local blind test for MP3 bitrate perception.
 
 TinEar 把你自己音乐库里的无损片段切成 15 秒，生成不同码率的 MP3 版本，
 再把**无损版**和**压缩版**做成一组等响度、精确对齐的 A/B 让你盲听 ——
-你不知道哪边是无损，程序也不告诉你码率、文件名、编码器。
+作答前你不知道哪边是无损，程序也不告诉你码率、文件名、编码器（每题作答后可以点「查看答案」揭晓本题）。
+
+---
+
+## 前置条件
+
+- **Python 3.10+**（开发与实测用 3.12）
+- **系统已安装 `ffmpeg` 与 `ffprobe`**（实测 6.1.1）—— 本项目不打包也不自动安装它们，
+  启动时会检查，缺失会直接报错
+- Python 依赖全是 wheel（`soundfile` 自带 libsndfile），不需要编译器或系统库
 
 ---
 
 ## 快速开始
 
-```bash
-cd tin_ear
+### 方式一：venv（通用，推荐给新同学）
 
-make install     # 把依赖装进本项目专用 conda 环境 tin_ear（只需一次）
-make run         # 前台启动，监听 0.0.0.0:8000（Ctrl+C 停止）
+```bash
+git clone <你的仓库地址> && cd tin_ear
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-不想占着终端就用后台方式：
+然后在浏览器打开 <http://localhost:8000>。
+
+### 方式二：Makefile（作者自用，conda 环境名 `tin_ear`）
 
 ```bash
+make install     # 安装依赖（解释器自动挑选：项目内 .venv → conda 环境 tin_ear → python3）
+make run         # 前台启动（Ctrl+C 停止）
 make run-bg      # 后台启动，日志写 data/server.log
 make stop        # 停止
+make test        # 跑自动化测试（约 1 分钟）
+make help        # 看全部目标与当前使用的解释器
 ```
 
-然后在 **Windows 浏览器**打开 <http://localhost:8000>（WSL 不出声，必须在 Windows 侧播放）。
+`PY` / `HOST` / `PORT` 都可以覆盖，例如 `make run PY=.venv/bin/python HOST=127.0.0.1`。
 
-`make help` 可看全部目标。等价的手工命令：
+> **安全提示**：这是一个**本地单用户**工具，接口不带任何认证。默认绑 `0.0.0.0` 是为了方便
+> （虚拟机里的服务 + 宿主机浏览器访问）；如果机器在共享或不可信网络上，请用 `HOST=127.0.0.1`
+> 启动，或自行加反向代理与鉴权。
 
-```bash
-PIP_CACHE_DIR="$PWD/.pip-cache" TMPDIR="$PWD/data/tmp" \
-  ~/miniforge3/envs/tin_ear/bin/python -m pip install -r requirements.txt
+### 作者的验证环境（WSL + Windows 浏览器）
 
-TMPDIR="$PWD/data/tmp" \
-  ~/miniforge3/envs/tin_ear/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1
-```
+本项目在 WSL Ubuntu 下开发，用 Windows 侧浏览器访问 `http://localhost:8000`，因此文档里保留了一些
+Windows 相关注意事项（见「听测注意事项」）。WSL 里没有音频设备是正常的，必须在 Windows 侧播放。
 
-### 环境纪律
+### 本项目对环境的影响
 
-- Python 依赖**只**装进本项目专用 conda 环境 `tin_ear`；不碰 `base`、不碰其他项目环境、
-  不 `apt install`、不 `npm -g`、不 `pip --user`。
-- pip 下载缓存放在项目内 `.pip-cache/`；所有临时文件放在项目内 `data/tmp/`
-  （`TMPDIR` + `tempfile.tempdir` 双重保证），不写系统 temp 或 `~/.cache`。
-- 依赖全是 wheel（`soundfile` 自带 libsndfile），不需要编译器或系统库；ffmpeg/ffprobe 用系统已有的。
+- 默认**不改动**系统与其他项目：pip 下载缓存写项目内 `.pip-cache/`，运行时临时文件全部写项目内
+  `data/tmp/`（`TMPDIR` + `tempfile.tempdir` 双重保证），不写系统 temp、不写 `~/.cache`。
+- 依赖只装进你自己的虚拟环境/conda 环境（本项目从不 `apt install`、不 `npm -g`、不 `pip --user`）。
+- `requirements.lock.txt` 是作者机器上实测通过的完整环境快照（`pip list --format=freeze` 的输出），
+  仅供参考与复现问题；正常安装请用 `requirements.txt`。
 
 ---
 
@@ -72,7 +88,7 @@ TMPDIR="$PWD/data/tmp" \
 
 ### 听测注意事项（重要）
 
-- 关闭 Windows 音效增强、Dolby、EQ、空间音频、音量均衡。
+- 关闭音效增强 / 空间音频 / 音量均衡（Windows：音效增强、Dolby、EQ、空间音频）。
 - 系统音量固定，测试过程中不要再调。
 - 用同一副耳机/音箱，从低码率题开始适应；疲劳了就停。
 - 若页面顶部出现"设备实际采样率不是 48 kHz"的黄色警告，说明浏览器正在重采样，可能削弱可听差异。
@@ -118,7 +134,7 @@ data/
 ## 测试
 
 ```bash
-make test    # 58 项，约 1 分钟
+make test    # 58 项，约 1 分钟（需要 make install-dev 装过 pytest/httpx）
 ```
 
 - `tests/test_pipeline.py`：常量守护、对齐符号与真实 MP3 往返、等响度/峰值、
@@ -149,7 +165,8 @@ make test    # 58 项，约 1 分钟
 
 ## 常见问题
 
-**导入后没有声音？** WSL 不出声是正常的，必须在 Windows 浏览器里打开 <http://localhost:8000>。
+**导入后没有声音？** 如果后端跑在 WSL 等没有音频设备的虚拟机里，是正常的 —— 在宿主机浏览器里打开
+<http://localhost:8000> 即可。
 
 **导入被拒绝？** 检查是否为无损格式、采样率是否 ≥ 44.1 kHz、时长是否 ≥ 30 秒；错误信息会说明具体原因。
 
@@ -172,6 +189,12 @@ make test    # 58 项，约 1 分钟
 
 不做 ABX、不做自适应难度、不做账号/多用户/持久历史、不做 AAC/Opus 对比、不做动态片段长度、
 不引入前端框架或构建工具、不使用数据库。
+
+---
+
+## 许可证
+
+[MIT](LICENSE) © 2026 Lequan_Zhang
 
 ---
 

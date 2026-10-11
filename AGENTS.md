@@ -1,5 +1,8 @@
 # AGENTS.md — TinEar
 
+> 本文档是项目的开发规范与实现记录，**面向维护者**；面向使用者的说明见 [README.md](README.md)。
+> 许可证：MIT，见 [LICENSE](LICENSE)。
+
 ## 1. 项目
 
 TinEar — 本地音频盲测工具。用户管理本地音频库，选 1～3 段开始测试，程序自动截取 15 秒片段，生成 MP3 压缩版，按难度出题，用户判断无损 FLAC 与不同码率 MP3 哪个更好。
@@ -15,7 +18,8 @@ TinEar — 本地音频盲测工具。用户管理本地音频库，选 1～3 �
 - 原生 HTML/CSS/JS，无框架、无构建
 - Web Audio API，AudioContext 固定 48000 Hz
 - 无数据库。库信息用 JSON，会话状态用内存 dict
-- WSL Ubuntu 跑后端，Windows 浏览器访问 `http://localhost:8000`
+- WSL Ubuntu 跑后端，浏览器访问 `http://localhost:8000`（作者的验证环境，代码本身跨平台）
+- 许可证：MIT
 
 禁止：Node.js、JDK、Docker、Electron、SQLite、librosa、React、Vue、Vite、Webpack。
 
@@ -47,11 +51,13 @@ tinear/
       <session_id>/
     tmp/                  # 临时：上传落盘与 ffmpeg 中间文件，启动清空
   .pip-cache/             # pip 下载缓存（项目内，gitignore）
-  requirements.txt
-  requirements-dev.txt
-  requirements.lock.txt
-  Makefile                # install / run / test / clean-cache
-  README.md
+  requirements.txt        # 运行期依赖（正常安装只需要这一份）
+  requirements-dev.txt    # 测试依赖（pytest / httpx）
+  requirements.lock.txt   # 作者机器实测通过的环境快照（pip list --format=freeze），仅供参考
+  Makefile                # install / install-dev / run / run-bg / stop / test / clean-cache
+  LICENSE                 # MIT
+  README.md               # 面向使用者
+  AGENTS.md               # 本文件，面向维护者
 ```
 
 ## 4. 配置常量（app.py 顶部）
@@ -287,8 +293,9 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 
 ## 9. 验收标准
 
-1. `pip install -r requirements.txt && uvicorn app:app --host 0.0.0.0 --port 8000` 直接跑。
-2. Windows 浏览器访问 `http://localhost:8000` 走通导入、测试、结果。
+1. `pip install -r requirements.txt && uvicorn app:app --host 0.0.0.0 --port 8000` 直接跑
+   （前提：系统已有 `ffmpeg` / `ffprobe`）。
+2. 浏览器访问 `http://localhost:8000` 走通导入、测试、结果（作者在 Windows 浏览器上验证）。
 3. FLAC / WAV / AIFF 可导入，导入后为 48 kHz FLAC。
 4. MP3 / AAC / OGG / Opus 被拒绝，前端显示明确错误。
 5. 重复导入同 hash 被识别，不重复入库。
@@ -315,7 +322,7 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 #13 由 `test_cut_segment_drops_attached_picture` / `test_import_strips_attached_picture` /
 `test_start_with_cover_art_source_builds_stimuli` 覆盖；#14 由 `test_answer_is_final_and_replay_is_idempotent`
 覆盖；#15 由 `test_questions_shuffle_but_keep_identical_stimulus_set` / `test_stimuli_cached_and_reusable` 覆盖。
-**只有 #2（Windows 浏览器实操）与 #7 的主观听感需要人来点一遍。**
+**只有 #2（浏览器实操）与 #7 的主观听感需要人来点一遍。**
 
 ## 10. 非目标
 
@@ -347,17 +354,23 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 ## 12. 环境准备
 
 ```bash
-# ffmpeg / ffprobe 用系统已有的 6.1.1，本项目不 apt install、不装任何全局包
-make install     # = pip install -r requirements.txt，装进本项目专用 conda 环境 tin_ear
+# 前置：系统已有 ffmpeg / ffprobe（实测 6.1.1）；本项目不 apt install、不装任何全局包
+make install     # = pip install -r requirements.txt（解释器自动探测，可用 PY= 覆盖）
 make run         # 前台启动（Ctrl+C 停止）；或 make run-bg 后台启动 + make stop 停止
-make test        # 58 项自动化测试
+make test        # 58 项自动化测试（需要 make install-dev）
 ```
 
+- **解释器**：`Makefile` 的 `PY` 会按「项目内 `.venv` → 作者的 conda 环境 `tin_ear` → `python3` → `python`」
+  自动挑选，也可以用 `make run PY=/path/to/python` 覆盖。`HOST`（默认 `0.0.0.0`）与 `PORT`（默认 `8000`）同样可覆盖。
+- **公开仓库的可移植性**：README 给出通用 `venv` 路线；`make` 只是作者自用的便捷层，
+  任何机器上 `python -m uvicorn app:app` 都能跑起来（只要装了 `requirements.txt` 与系统 ffmpeg）。
+- **安全**：这是本地单用户工具，接口无认证。默认绑 `0.0.0.0` 是为了虚拟机 + 宿主机浏览器访问；
+  共享/不可信网络请用 `HOST=127.0.0.1` 或自行加反代与鉴权。
 - pip 缓存与临时文件都留在项目内（`.pip-cache/`、`data/tmp/`），不写系统 temp、`~/.cache`，
   也不动 `base` 或其他项目的 conda 环境。
 - 依赖全是 wheel（`soundfile` 自带 libsndfile），不需要编译器或系统库。
 
-测试注意：关 Windows 音效增强、Dolby、EQ、空间音频；系统音量固定；WSL 不出声，用 Windows 浏览器访问 localhost 播放。
+测试注意：关 Windows 音效增强、Dolby、EQ、空间音频；系统音量固定；WSL 不出声，用宿主机浏览器访问 localhost 播放。
 
 ## 13. 关键决策
 
@@ -386,7 +399,7 @@ make test        # 58 项自动化测试
 ## 14. 测试
 
 ```bash
-make test     # = TMPDIR=<项目>/data/tmp <tin_ear>/bin/python -m pytest -q
+make test     # = TMPDIR=<项目>/data/tmp $(PY) -m pytest -q（PY 见 §12，可覆盖）
 make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 ```
 
