@@ -37,7 +37,7 @@ soundfile 做解码、对齐与响度分析；前端是**原生 HTML/CSS/JS**（
 ### 方式一：venv（通用，推荐给新同学）
 
 ```bash
-git clone <你的仓库地址> && cd tin_ear
+git clone https://github.com/ID-izlq-Github/tin_ear.git && cd tin_ear
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
