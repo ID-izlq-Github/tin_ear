@@ -1,6 +1,7 @@
 # AGENTS.md — TinEar
 
-> 本文档是项目的开发规范与实现记录，**面向维护者**；面向使用者的说明见 [README.md](README.md)。
+> 文档分工：[README.md](README.md) 面向**使用者**（项目介绍、技术栈、安装、使用命令、排错），
+> 本文件面向**维护者**（开发细节、设计取舍、测试、实测数据、项目现状与交接信息）。
 > 许可证：MIT，见 [LICENSE](LICENSE)。
 
 ## 1. 项目
@@ -43,7 +44,7 @@ tinear/
         seg_0.flac
         seg_1.flac        # 仅当源时长 ≥ 60 秒
         stimuli/
-          v1/             # v{STIMULI_ALGO_VERSION}，版本变化即重算
+          v2/             # v{STIMULI_ALGO_VERSION}，任何改变刺激内容的常量都要 bump（当前 = 2）
             index.json    # 每对刺激的 LUFS / True Peak / lag / 增益
             seg0_96k_ll.wav + seg0_96k_mp3.wav
             seg0_p0.wav   # 安慰剂（A/B 同一份文件）
@@ -68,7 +69,7 @@ tinear/
 SAMPLE_RATE = 48000
 CHANNELS = 2
 SEGMENT_SECONDS = 15
-TARGET_LUFS = -23.0
+TARGET_LUFS = -18.0        # 等响归一化目标（原 -23 = EBU R128 广播标准，日常试听偏轻）
 TRUE_PEAK_DBTP = -1.0
 
 SHORT_TEST_BITRATES = [48, 96, 160, 224, 320]
@@ -87,7 +88,8 @@ SESSION_TTL_SECONDS = 7200
 SEGMENT_STEP_SECONDS = 5
 SEGMENT_SAMPLES = 720000           # = 625 个 MPEG-1 Layer III 帧，与采样率精确对齐
 SEGMENT_FADE_SECONDS = 0.02
-STIMULI_ALGO_VERSION = 1           # 刺激缓存版本，与 SEGMENT_ALGO_VERSION 同步 bump
+STIMULI_ALGO_VERSION = 2           # 刺激缓存版本：改 TARGET_LUFS / 峰值上限 / MP3 参数都要 bump
+                                   # （v2：TARGET_LUFS -23 → -18）
 MAX_LUFS_DIFF_LU = 0.05            # 测试断言阈值（协议上限仍是 0.3）
 MIN_SECONDS_FOR_SECOND_SEGMENT = 60
 ANALYSIS_SR = 16000                # 片段打分用的分析解码（单声道）
@@ -192,6 +194,8 @@ n=5 需 4/5（p=0.045）、n=10 需 7/10（p=0.020）。详细模式 20 道真�
   然后统一裁剪/补零到**精确 720000 采样**。
 - **响度与峰值（对原文的修正）**：
   1. 两路各自按 integrated loudness 独立增益 `g_i = TARGET_LUFS - L_i` —— 响度差恒为 0，不留响度线索；
+     `TARGET_LUFS = -18`（实测本机素材波峰因数 ≈ 12.7 dB → 真峰值 ≈ -5.3 dBTP，距 -1 dBTP 上限还有 4.3 dB；
+     若调到 -14 以上，动态大的段落会开始触发峰值衰减，那时整题会比你设定的目标轻一点）。
   2. 再对这一对施加**同一个**线性衰减 `delta = min(0, TRUE_PEAK_DBTP - max(TP_i + g_i))`，
      使两路 True Peak 都 ≤ `-1 dBTP`。
   **不使用限幅器**：限幅是非线性处理，在 32–64 kbps 会引入与 MP3 编码无关的失真，等于给低码率题加额外线索。
@@ -223,7 +227,7 @@ DELETE /api/library/{audio_id}            → 200 { deleted, freed_bytes } / 404
 DELETE /api/cache                         → 清空片段与刺激缓存 data/cache { freed_bytes }
 
 POST /api/start                   body: { audio_ids, mode }
-                                  → { session_id, total, mode, stimuli: {generated, reused} }
+                                  → { session_id, total, mode, stimuli: {generated, reused}, target_lufs }
 GET  /api/question?session_id=&index=       → 仅 { index, total, question_id, url_a, url_b }
 POST /api/answer                  body: { session_id, question_id, choice, reaction_ms }
                                   → { ok, index, next_index, done, accepted, reveal }
@@ -283,6 +287,10 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 `刺激缓存 X MB（上面那个按钮释放的就是它；下次测试重新生成）· 临时文件 Y KB（上传/编码草稿，后端每次启动自动清空，不需要手动管）`。
 
 **测试**：题号/总数、进度条、A/B 播放按钮（循环、5 ms 淡入淡出）、三选项（A 更好 / B 更好 / 听不出）。不显示文件名、码率、编码器、时长。
+A/B 下面有**试听音量滑条**（−40 dB…0 dB，到底 = 静音；`↑/↓` 键 ±2 dB）：它接在 5 ms 淡入淡出节点之后、
+输出之前，**A/B 共用同一个 GainNode**，所以物理上不可能只把某一边调响，不影响判定。
+滑条旁边那句提示由 `/api/start` 返回的 `target_lufs` 填出来（"刺激已等响归一化到 −18 LUFS…"），
+避免把数字写死在 HTML 里。
 
 **作答后停留在本题**（不自动跳题）：高亮已选项、其余变暗，显示「已记录：X 更好」，并提供
 「查看答案」（**可选**手动揭晓，默认不自动揭晓以免对后续题产生反馈偏置）与「下一题 →」（末题为「查看结果 →」）。
@@ -325,8 +333,10 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 15. 出题顺序每轮随机（含安慰剂），而每轮用到的刺激集合完全一致（缓存必然复用）。
 16. `/` 与 `/static/*` 返回 `Cache-Control: no-cache, must-revalidate`，页面用 `?v=N` 引用 JS/CSS ——
     浏览器不会拿旧脚本去调新接口（见 §15 第 5 条）。
+17. 试听音量滑条只改变监听增益（A/B 共用同一节点，不可能单边调整）；刺激文件本身统一归一到 −18 LUFS，
+    `/api/start` 把 `target_lufs` 报给前端。
 
-自动化覆盖对照（`make test`，60 项）：#1 见 README 的安装/运行两行命令；#3/#4/#5 由 `test_api.py`
+自动化覆盖对照（`make test`，61 项）：#1 见 README 的安装/运行两行命令；#3/#4/#5 由 `test_api.py`
 的导入与拒绝用例覆盖；#6/#10/#11 由清理用例覆盖（含硬链接 inode 断言、"答完/结束后才能删除"的回归用例，
 以及 `test_clear_cache_only_touches_stimuli_cache`：**「清理刺激缓存」只清 `data/cache`**，
 不碰 `data/tmp` / `data/session` / `data/library`）；
@@ -339,7 +349,9 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 #13 由 `test_cut_segment_drops_attached_picture` / `test_import_strips_attached_picture` /
 `test_start_with_cover_art_source_builds_stimuli` 覆盖；#14 由 `test_answer_is_final_and_replay_is_idempotent`
 覆盖；#15 由 `test_questions_shuffle_but_keep_identical_stimulus_set` / `test_stimuli_cached_and_reusable` 覆盖；
-#16 由 `test_static_assets_are_revalidated` 覆盖（含"前端不再引用旧 `correct_side` 字段"的静态断言）。
+#16 由 `test_static_assets_are_revalidated` 覆盖（含"前端不再引用旧 `correct_side` 字段"的静态断言）；
+#17 由 `test_frontend_volume_slider_is_wired` 覆盖（滑条存在、接线成 `gain → volume → destination`、
+    `/api/start` 返回 `target_lufs == -18.0`）。
 **只有 #2（浏览器实操）与 #7 的主观听感需要人来点一遍。**
 
 ## 10. 非目标
@@ -375,7 +387,7 @@ session 目录内的硬链接；磁盘文件名（`_ll` / `_mp3` / `seg0_96k`）
 # 前置：系统已有 ffmpeg / ffprobe（实测 6.1.1）；本项目不 apt install、不装任何全局包
 make install     # = pip install -r requirements.txt（解释器自动探测，可用 PY= 覆盖）
 make run         # 前台启动（Ctrl+C 停止）；或 make run-bg 后台启动 + make stop 停止
-make test        # 60 项自动化测试（需要 make install-dev）
+make test        # 61 项自动化测试（需要 make install-dev）
 ```
 
 - **解释器**：`Makefile` 的 `PY` 会按「项目内 `.venv` → 作者的 conda 环境 `tin_ear` → `python3` → `python`」
@@ -416,6 +428,14 @@ make test        # 60 项自动化测试（需要 make install-dev）
   要让结论变硬就把 `SHORT_TEST_TOTAL` / `DETAILED_TEST_TOTAL` 调大（阶梯会循环重复）；
   达到 80% 功效约需每档 7 题（由 `_required_n()` 算出并显示在结果页）。
 - 作答**首答即最终**：否则"先点听不出 → 看揭晓码率 → 改成正解"就能刷分。
+- **等响归一化目标取 -18 LUFS（而不是 -23）**：-23 是 EBU R128 广播标准，日常试听要一直把系统音量拧很大；
+  -18 实测只把真峰值推到 -5.3 dBTP（离 -1 dBTP 上限还有 4.3 dB），几乎不会触发共同峰值衰减。
+  若继续提到 -14 以上，波峰因数大的段落会被峰值上限压回、导致各题响度不一致（A/B 内部仍然等响，题仍然有效）。
+  **注意：调这个常量不会改变题目难度** —— 两路是同一组增益同时放大，ΔLUFS 恒为 0、MP3 的伪影/信号比在编码时就定死了。
+  改它必须 bump `STIMULI_ALGO_VERSION`，否则会复用旧响度的缓存。
+- **前端再加一层试听音量**（-40…0 dB 滑条 + `↑/↓`）：它只改监听增益（A/B 共用同一个 GainNode），
+  不写回文件、不可能单边调整，因此既方便又不会破坏盲测；界面把 `target_lufs` 显示出来，
+  让用户知道"文件本身已经够响，滑条只是舒适度"。
 - ffmpeg 的所有转码/切片/编码命令都显式 `-map 0:a:0`：内嵌封面是独立的 `attached_pic` 视频流，
   一旦混进片段就会让 MP3 编码以 rc=234 失败（详见 §6）。
 
@@ -437,6 +457,8 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
   题目参数校验、**防泄漏**、`reveal` 只在作答后返回且只含本题、首答即最终与幂等重放、安慰剂两路内容相同、
   带封面源的端到端出题回归、结果统计（p 值/显著/样本不足/`status` 枚举）与结论文案、
   **静态资源强制重验证**（`test_static_assets_are_revalidated`）、
+  **试听音量滑条接线**（`test_frontend_volume_slider_is_wired`：`gain → volume → destination`、
+  `/api/start` 报 `target_lufs`）、
   **「清理刺激缓存」的作用域**（`test_clear_cache_only_touches_stimuli_cache`：只清 `data/cache`）、
   启动清理、TTL 清理、路径穿越。
 - `pytest.ini`：`tmp_path_retention_policy = failed` —— 测试产物落在项目内 `data/tmp/`，
@@ -450,7 +472,8 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 | 15 s @48 kHz | 720000 采样 = 恰好 625 个 MPEG-1 Layer III 帧 |
 | MP3 编码到**文件**（`-write_xing 1` 生效） | 解码回来仍是 720000 采样，lag = 0 |
 | MP3 编码到**管道**（无 LAME 头） | 解码得 721152 采样，lag = 1105（23.0 ms）；对齐器可兜住，结果仍 720000 / ΔLUFS = 0 |
-| 每对刺激 | ΔLUFS = 0.0000 LU（32/64/128/320 kbps 均如此）；True Peak ≈ -10.3 dBTP；共同衰减 delta = 0 |
+| 每对刺激 | ΔLUFS = 0.0000 LU（32/64/128/320 kbps 均如此）；TARGET_LUFS = -18 → True Peak ≈ -5.3 dBTP；共同衰减 delta = 0（距 -1 dBTP 上限还有 4.3 dB） |
+| 响度目标对比 | -23 LUFS（EBU R128）时真峰值 ≈ -10.3 dBTP，余量 9.3 dB —— 白白浪费动态余量、日常试听偏轻；-18 后余量 4.3 dB |
 | 单个刺激文件 | 5760088 字节（5.76 MB + WAV 头），A/B 完全等长 |
 | 缓存体积 | 单段跑满 11 档 ≈ 130 MB（实测一次旧 detailed 后释放 130271006 字节）；新 detailed（20 真实 + 2 安慰剂、2 个片段全用上）实测 **245.8 MB**/首 |
 | `/api/start` 首次生成 10 对刺激 | 7.8 s；命中缓存后 < 0.2 s |
@@ -475,3 +498,25 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
    `/` 与 `/static/*` 强制重验证（§7）、`index.html` 用 `?v=N` 引用资源、揭晓函数改成**任何分支都显示东西**
    （拿不到 `reveal` 就提示强制刷新）。由 `test_static_assets_are_revalidated` 守护。
    > 教训：凡是"点了按钮但什么都没发生"的交互，函数里都不能有会抛异常的隐式假设。
+
+## 16. 项目现状（交接摘要）
+
+- **状态**：功能完整可用。`make test` **61 项**全绿（约 1 分钟）。
+- **提交历史**：`git log --oneline` —— 脚手架 → 后端 + 管线测试 → 前端 + API 测试 + 文档 →
+  会话/作答两个修复 → 封面流修复、乱序与揭晓、统计口径与 22 题 → 上传前的许可证与可移植性整理 →
+  揭晓静默失败修复 + 结果页改版 → 清理目标与临时目录治理 → 响度提到 −18 LUFS + 试听音量滑条。
+- **关键实测**：每对 ΔLUFS = 0.0000 LU、真峰值 ≈ −5.3 dBTP（−18 LUFS 下）、两路各 5760088 字节（无体积泄漏）、
+  22 题详细模式首轮 15.8 s / 缓存复用 0.01 s、刺激缓存 245.8 MB/首、`POWER_REQUIRED_N = 7`。
+  完整表见 §15。
+- **待人工验证**：验收 #2（浏览器实操）与 #7 的主观听感；其余 15 条已自动化（对照表见 §9）。
+- **可一行调整的行为**（都在 `app.py` 顶部）：`TARGET_LUFS`（改完要 bump `STIMULI_ALGO_VERSION`）、
+  `SHORT_TEST_TOTAL` / `DETAILED_TEST_TOTAL` 与两条码率阶梯、`SHUFFLE_ALL_QUESTIONS`、
+  `PLACEBO_SAME_SEGMENT`、`SEG_WEIGHTS`、`CHANCE_LEVEL` / `ALPHA` / `MIN_N_FOR_SIGNIFICANCE`；
+  前端是否自动揭晓答案在 `static/app.js` 的 `renderConfirmation()`（默认只显示"已记录"，答案需手动点）；
+  试听音量范围/步长在 `static/index.html` 的 `#volume-input` 与 `app.js` 的 `VOLUME_*` 常量。
+  **改完 `static/` 记得把 `index.html` 里的 `?v=N` 加一。**
+- **数据与清理**：`data/library/` 是用户的音频（持久，永不自动删除）；`data/cache/` 可随时重建；
+  `data/session/`、`data/tmp/` 每次启动自动清空。清理命令见 §12（`make size` / `clean-pip-cache` /
+  `clean-cache` / `clean`），面向用户的说明在 README「想清理磁盘占用怎么办」。
+- **若日后要接着做**：优先考虑「提高检验功效」（`DETAILED_TEST_TOTAL` 调大或新增重复档位模式）、
+  ABX 化（当前非目标）、以及给多点位/多版本对比留接口；改动刺激内容一律 bump `STIMULI_ALGO_VERSION`。
