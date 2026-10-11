@@ -24,7 +24,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -175,6 +175,47 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+# `os.replace` 在 Windows 上的重试节奏（见 `_replace_with_retry`）：合计约 1.6 s
+_REPLACE_RETRY_DELAYS = (0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.4, 0.8)
+
+
+def _is_file_busy(exc: OSError) -> bool:
+    """是否是"目标文件正被另一个句柄占着"这一类可重试错误。
+
+    Windows 上 `PermissionError` 覆盖了 WinError 5（拒绝访问 / ERROR_ACCESS_DENIED）与
+    WinError 32（另一个程序正在使用此文件 / ERROR_SHARING_VIOLATION），WinError 33
+    （ERROR_LOCK_VIOLATION）也一并算上 —— 三者都是短命占用，重试就能过。
+    """
+    if isinstance(exc, PermissionError):
+        return True
+    return getattr(exc, "winerror", None) in (5, 32, 33)
+
+
+def _replace_with_retry(src: Path, dst: Path) -> None:
+    """`os.replace` + 对"文件被占用"做有限重试。
+
+    POSIX 下替换一个正被别人打开的文件是合法操作，Windows 下不是：只要目标还有别的句柄
+    开着（我们自己的 `sf.info` / `sf.read`、浏览器 `/api/audio` 的 FileResponse、杀毒软件
+    或索引器的扫描），`MoveFileEx(REPLACE_EXISTING)` 就抛 WinError 5「拒绝访问」。这些占用
+    都是短命的，所以按 `_REPLACE_RETRY_DELAYS` 重试；真的释放不了才把异常抛出去，不吞掉
+    真正的权限错误。
+    """
+    last: OSError | None = None
+    for delay in _REPLACE_RETRY_DELAYS:
+        if delay:
+            time.sleep(delay)
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as exc:
+            if not _is_file_busy(exc):
+                raise
+            last = exc
+    if last is not None:  # 重试表为空时不会走到这里，下面的裸调用兜底
+        raise last
+    os.replace(src, dst)
+
+
 def _read_json(path: Path, default):
     try:
         return json.loads(path.read_text("utf-8"))
@@ -185,8 +226,13 @@ def _read_json(path: Path, default):
 def _write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + f".tmp{os.getpid()}")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+        _replace_with_retry(tmp, path)
+    except BaseException:
+        # 替换失败（例如重试后仍被占用）时别把半成品留在缓存目录里
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _dir_size(path: Path) -> int:
@@ -339,10 +385,16 @@ def _write_wav_atomic(path: Path, data: np.ndarray) -> None:
     并发生成时，同一片段的多个码率会写**同一个**共享无损文件（见 `_ensure_stimuli`）；
     直接往目标路径写，后到的任务可能截断别人刚写完的文件、或让检查方读到半截数据。
     内容按构造就是逐位相同的，所以谁最后到都一样。
+
+    Windows 上"目标正被读"会让替换失败（见 `_replace_with_retry`），失败时临时文件必须清掉。
     """
     tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
-    _write_wav(tmp, data)
-    os.replace(tmp, path)
+    try:
+        _write_wav(tmp, data)
+        _replace_with_retry(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _stimulus_lsb() -> float:
@@ -622,7 +674,7 @@ async def _import_one(upload: UploadFile) -> dict:
                     "source_channels": probe["channels"],
                     "added_at": _now_iso(),
                 }
-                os.replace(converted, _audio_path(audio_id))
+                _replace_with_retry(converted, _audio_path(audio_id))
                 lib["items"].append(item)
                 _write_json(LIBRARY_INDEX, lib)
         finally:
@@ -892,6 +944,14 @@ def _stimuli_key(seg_index: int, bitrate: int | None, alt_seg: int | None = None
     return f"seg{seg_index}_{bitrate}k"
 
 
+# 每个交付文件一把锁，键是路径字符串。见 `_ensure_stimuli` 里的说明。
+_STIMULUS_WRITE_LOCKS: dict[tuple[object, str], asyncio.Lock] = {}
+
+
+def _stimulus_write_lock(path: Path) -> asyncio.Lock:
+    return _loop_scoped_lock(_STIMULUS_WRITE_LOCKS, str(path))
+
+
 async def _ensure_stimuli(
     audio_id: str, seg_index: int, bitrate: int | None, alt_seg: int | None = None
 ) -> tuple[dict, bool]:
@@ -944,26 +1004,29 @@ async def _ensure_stimuli(
     shared_ll = info["gain_db"]["common_delta"] == 0.0
     ll_name = f"seg{seg_index}_ll.wav" if shared_ll else f"{key}_ll.wav"
 
-    if bitrate is None and (PLACEBO_SAME_SEGMENT or alt_seg is None):
+    placebo_same_file = bitrate is None and (PLACEBO_SAME_SEGMENT or alt_seg is None)
+    if placebo_same_file:
         # 安慰剂：A/B 是同一份文件。delta == 0 时它和无损侧本来就是同一份内容，直接共用。
-        if shared_ll:
-            path_ll = path_mp3 = cache_root / ll_name
-            await asyncio.to_thread(_write_wav_atomic, path_ll, out_ll)
-            files = {"ll": ll_name, "mp3": ll_name}
-        else:
-            path_ll = path_mp3 = cache_root / f"{key}.wav"
-            await asyncio.to_thread(_write_wav_atomic, path_ll, out_ll)
-            files = {"ll": path_ll.name, "mp3": path_ll.name}
+        path_ll = path_mp3 = cache_root / (ll_name if shared_ll else f"{key}.wav")
     else:
         path_ll = cache_root / ll_name
         path_mp3 = cache_root / f"{key}_mp3.wav"
-        await asyncio.to_thread(_write_wav_atomic, path_ll, out_ll)
-        await asyncio.to_thread(_write_wav_atomic, path_mp3, out_mp3)
-        files = {"ll": path_ll.name, "mp3": path_mp3.name}
+    files = {"ll": path_ll.name, "mp3": path_mp3.name}
 
-    # 整数位深下"内存数组"和"交付字节"不是一回事：这里以落盘文件为准补一次结构自检，
-    # 证明交付内容只是那份数组的量化（详见 `_verify_written_pair` 的说明）。
-    await asyncio.to_thread(_verify_written_pair, path_ll, path_mp3, out_ll, out_mp3)
+    # 「写文件 + 落盘自检」必须按**路径**串行：同一个共享无损文件会被同一片段的所有码率
+    # （含安慰剂）同时写，而 `_verify_written_pair` 是**读**这个文件做自检的。POSIX 允许
+    # 替换一个正被打开的文件，Windows 不允许 —— 目标只要还有读句柄开着（sf.info / sf.read），
+    # `os.replace` 就抛 WinError 5，`/api/start` 直接 500（重试见 `_replace_with_retry`，
+    # 那把锁才是根治：让"读自检"和"替换"根本不会重叠）。锁按路径字典序获取，避免反向加锁死锁。
+    async with AsyncExitStack() as stack:
+        for target in sorted({path_ll, path_mp3}, key=str):
+            await stack.enter_async_context(_stimulus_write_lock(target))
+        await asyncio.to_thread(_write_wav_atomic, path_ll, out_ll)
+        if path_mp3 != path_ll:
+            await asyncio.to_thread(_write_wav_atomic, path_mp3, out_mp3)
+        # 整数位深下"内存数组"和"交付字节"不是一回事：这里以落盘文件为准补一次结构自检，
+        # 证明交付内容只是那份数组的量化（详见 `_verify_written_pair` 的说明）。
+        await asyncio.to_thread(_verify_written_pair, path_ll, path_mp3, out_ll, out_mp3)
 
     entry = {
         "key": key,

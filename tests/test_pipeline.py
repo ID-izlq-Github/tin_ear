@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import shutil
 import subprocess
+import threading
 import time
 
 import numpy as np
@@ -547,6 +549,114 @@ def test_concurrent_stimuli_generation_is_identical_to_serial(client, monkeypatc
     keys_serial, digests_serial = run(1)
     assert keys_parallel == keys_serial
     assert digests_parallel == digests_serial
+
+
+def test_write_wav_atomic_retries_windows_sharing_violation(tmp_path, monkeypatch):
+    """Windows 回归：目标文件被别的句柄占着时 `os.replace` 抛 WinError 5（PermissionError），
+    必须有限重试，而不是把 500 抛给用户（真机报错见 MEASUREMENTS.md 的记录）。
+
+    模拟方式：前两次替换抛 `PermissionError`，第三次放行。
+    """
+    target = tmp_path / "seg0_ll.wav"
+    data = np.zeros((2048, 2), dtype=np.float32)
+    real_replace = os.replace
+    attempts = {"n": 0}
+
+    def flaky_replace(src, dst):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise PermissionError(13, "拒绝访问。")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(app_module, "_REPLACE_RETRY_DELAYS", (0.0, 0.0, 0.0, 0.0))
+    monkeypatch.setattr(app_module.os, "replace", flaky_replace)
+
+    app_module._write_wav_atomic(target, data)
+
+    assert attempts["n"] == 3, "被占用时应当重试"
+    written, sr = sf.read(str(target), dtype="float32")
+    assert sr == app_module.SAMPLE_RATE
+    assert written.shape == data.shape
+    assert not list(tmp_path.glob(".*.tmp")), "成功后不应留下临时文件"
+
+
+def test_write_wav_atomic_gives_up_and_cleans_tmp(tmp_path, monkeypatch):
+    """占用一直不释放时要把异常抛出去（不吞真错误），并且不留半成品临时文件。"""
+
+    def always_busy(src, dst):
+        raise PermissionError(5, "拒绝访问。")
+
+    monkeypatch.setattr(app_module, "_REPLACE_RETRY_DELAYS", (0.0, 0.0))
+    monkeypatch.setattr(app_module.os, "replace", always_busy)
+
+    with pytest.raises(PermissionError):
+        app_module._write_wav_atomic(tmp_path / "seg0_ll.wav", np.zeros((256, 2), dtype=np.float32))
+    assert not (tmp_path / "seg0_ll.wav").exists()
+    assert list(tmp_path.rglob(".*.tmp")) == [], "重试失败后临时文件不该留下"
+
+
+def test_replace_with_retry_does_not_swallow_real_errors(tmp_path, monkeypatch):
+    """只有"被占用"这一类才重试；真正的参数/权限错误必须一次就抛。"""
+    attempts = {"n": 0}
+
+    def broken(src, dst):
+        attempts["n"] += 1
+        raise OSError(22, "Invalid argument")
+
+    monkeypatch.setattr(app_module, "_REPLACE_RETRY_DELAYS", (0.0, 0.0, 0.0))
+    monkeypatch.setattr(app_module.os, "replace", broken)
+
+    with pytest.raises(OSError):
+        app_module._replace_with_retry(tmp_path / "a", tmp_path / "b")
+    assert attempts["n"] == 1
+
+
+def test_shared_stimulus_write_and_verify_are_serialized(client, monkeypatch, long_source):
+    """根因守护：同一共享无损文件的「写」不能与它的「落盘自检读」重叠。
+
+    Windows 上 `os.replace` 的目标只要还有读句柄开着就抛 WinError 5 —— 并发准备时，
+    一个码率任务正在 `_verify_written_pair` 里读 `seg{S}_ll.wav`，另一个码率任务去替换它，
+    `/api/start` 就 500（真机 traceback）。这里把自检的读窗口人为拉长，若写/读没有按路径
+    串行（修复前），并发任务必然被抓到重叠；修复后 `overlaps` 必须为空。
+    """
+    monkeypatch.setattr(app_module, "SHORT_TEST_BITRATES", [64, 96, 128, 160, 320])
+    monkeypatch.setattr(app_module, "SHORT_TEST_TOTAL", 6)  # 5 真实 + 1 安慰剂
+    audio_id = upload(client, long_source)["audio_id"]
+
+    guard = threading.Lock()
+    reading: set[str] = set()
+    writes: dict[str, int] = {}
+    overlaps: list[str] = []
+
+    real_verify = app_module._verify_written_pair
+    real_write = app_module._write_wav_atomic
+
+    def slow_verify(path_ll, path_mp3, out_ll, out_mp3):
+        names = {path_ll.name, path_mp3.name}
+        with guard:
+            reading.update(names)
+        try:
+            time.sleep(0.05)  # 拉长"读句柄开着"的窗口
+            return real_verify(path_ll, path_mp3, out_ll, out_mp3)
+        finally:
+            with guard:
+                reading.difference_update(names)
+
+    def watching_write(path, data):
+        with guard:
+            writes[path.name] = writes.get(path.name, 0) + 1
+            if path.name in reading:
+                overlaps.append(path.name)
+        return real_write(path, data)
+
+    monkeypatch.setattr(app_module, "_verify_written_pair", slow_verify)
+    monkeypatch.setattr(app_module, "_write_wav_atomic", watching_write)
+
+    start_session(client, [audio_id])  # 冷缓存：同一片段的每个码率都要写同一个 seg{S}_ll.wav
+
+    shared_writes = sum(n for name, n in writes.items() if name.endswith("_ll.wav"))
+    assert shared_writes >= 2, "本用例必须真的出现「多个任务写同一份共享无损文件」才有意义"
+    assert overlaps == [], f"写入 {overlaps} 时该文件正被自检读取（Windows 上会 WinError 5）"
 
 
 def test_concurrency_autodetect(monkeypatch):

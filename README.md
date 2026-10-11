@@ -284,7 +284,7 @@ Get-ChildItem -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Fo
 ## 测试
 
 ```bash
-make test    # 方式二：79 项，约 1.5 分钟（需要先 make install-dev 装过 pytest/httpx）
+make test    # 方式二：83 项，约 1.5 分钟（需要先 make install-dev 装过 pytest/httpx）
 ```
 
 不用 Makefile（`python app.py` / 方式一）也能跑，关键是别把临时文件丢到系统 temp 里：

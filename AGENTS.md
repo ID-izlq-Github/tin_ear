@@ -212,15 +212,26 @@ n=5 需 4/5（p=0.045）、n=10 需 7/10（p=0.020）。详细模式 20 道真�
   这些额外条目只写缓存、不挂到题目上，计数单独报 `prewarmed`（否则用户会看到"22 题却新生成 23 段"）；
   进度条的总量把预热量算进去（4.4 s / 23 个）。反方向（快速 → 详细）缺 17 个组合，是阶梯覆盖问题，
   预热消不掉 —— 要消掉只能首次生成全集（§13 里权衡过，没做）。
-- **并发下的两个共享资源**（都出过或差点出问题）：
+- **并发下的三个共享资源**（都出过问题）：
   1. `stimuli/index.json` 是「读 → 改 → 写」，必须在锁里**重新读一次**再合并写，
      否则后写的会覆盖别人刚登记的条目（文件在、索引丢 → 下次白重算）；
   2. `_ensure_segments` 对同一个 audio_id 串行化，否则两个任务会同时判定"没缓存"、
-     各自 `rmtree` + 重算，互相删掉对方产物。
-  两把锁都通过 `_loop_scoped_lock(box, key)` 按**「事件循环 + key」**取：`asyncio.Lock` 一旦被争用
+     各自 `rmtree` + 重算，互相删掉对方产物；
+  3. **交付文件的「写 + 落盘自检」按路径串行**（`_STIMULUS_WRITE_LOCKS` / `_stimulus_write_lock`）：
+     同一个共享无损文件被同一片段的所有码率同时写，而 `_verify_written_pair` 是**读**它做自检的。
+     POSIX 允许替换一个正被打开的文件，Windows 不允许 —— 目标只要还有读句柄（`sf.info` / `sf.read`）
+     就抛 `PermissionError: [WinError 5] 拒绝访问`，`/api/start` 直接 500。这把锁让"读自检"和
+     "替换"根本不会重叠（`os.replace` 另有 `_replace_with_retry` 兜外部占用：浏览器
+     FileResponse、杀毒/索引器扫描；见 MEASUREMENTS.md §15.3）。
+  三把锁都通过 `_loop_scoped_lock(box, key)` 按**「事件循环 + key」**取：`asyncio.Lock` 一旦被争用
   就绑定当时的循环，而 pytest 每个用例都跑在新循环里，跨用例复用同一把模块级锁会抛
   `is bound to a different event loop`（由 `test_shared_locks_survive_multiple_event_loops` 守护）。
+  第 3 把锁一次按住两个路径，取锁顺序按路径字符串排序（否则两个任务反向加锁会死锁）。
   任一道题失败时 `_prepare_session` 会 cancel 其余任务，`_run_process` 在被取消时 kill 掉 ffmpeg 子进程。
+- **`os.replace` 不是跨平台等价的**：Windows 上目标被别的句柄占着就失败，所以全部替换点都走
+  `_replace_with_retry`（`_REPLACE_RETRY_DELAYS` 合计约 1.6 s，只对"被占用"重试，真错误一次就抛）；
+  `_write_wav_atomic` / `_write_json` 在替换最终失败时会清掉自己的临时文件（旧版本会把
+  `.seg1_ll.wav.<token>.tmp` 留在缓存目录里）。全项目 `os.replace` 只剩 `_replace_with_retry` 内部一处。
 - 无损版：片段 FLAC 解码为 48 kHz float32 母版。
 - **无损侧在同一片段内共用一份**（`seg{S}_ll.wav`）：`out_ll = master_fit * 10**((g_ll + delta)/20)`，而
   `master_fit` 与 `g_ll` 都只依赖片段，所以 **`delta` 相同 ⇒ 无损侧逐位相同**。默认 `TARGET_LUFS = -18` 下
@@ -417,7 +428,7 @@ A/B 下面有**试听音量滑条**（−40 dB…0 dB，到底 = 静音；`↑/�
 22. **无损侧在同一片段内共用一份**：`delta == 0` 时同一片段的所有码率（含安慰剂）都指向同一个
     `seg{S}_ll.wav`；触发共同峰值衰减（`common_delta != 0`）时自动退回每档一份。
 
-自动化覆盖对照（`make test`，79 项；每个用例的细节见 §14）：#1 由
+自动化覆盖对照（`make test`，83 项；每个用例的细节见 §14）：#1 由
 `test_python_app_py_entry_point_serves_the_api` 覆盖（真起子进程探活，断言输出里是
 `http://localhost:<port>`、没有 `Uvicorn running on` / `0.0.0.0`）；#3/#4/#5 导入与拒绝用例；
 #6/#10/#11 清理用例（含硬链接 inode 断言、"答完/结束后才能删除"的回归，以及
@@ -437,6 +448,10 @@ A/B 下面有**试听音量滑条**（−40 dB…0 dB，到底 = 静音；`↑/�
 `test_frontend_prepare_progress_is_wired`；#21 `test_detailed_round_prewarms_short_complement` /
 `test_prewarm_is_detailed_only_and_switchable`；#22 `test_lossless_side_is_bit_identical_across_bitrates` /
 `test_lossless_reference_is_shared_across_bitrates` / `test_sharing_falls_back_when_peak_attenuation_is_needed`。
+另有 4 条不属上面任何一条的**跨平台回归**（Windows 的 `os.replace`，见 §6 与 MEASUREMENTS.md §15.3）：
+`test_write_wav_atomic_retries_windows_sharing_violation` /
+`test_write_wav_atomic_gives_up_and_cleans_tmp` / `test_replace_with_retry_does_not_swallow_real_errors` /
+`test_shared_stimulus_write_and_verify_are_serialized`（最后一条是本根因的结构化守护，**把锁去掉必然失败**）。
 **#2（浏览器实操）与 #7 的主观听感已由作者在真机过了一遍（见 §16）；改 `static/` 或改测试音频内容后要重过 #2。**
 
 ## 10. 非目标（维护者红线）
@@ -469,7 +484,7 @@ README 的「它不做什么」是同一份清单的**用户口径**（只留用
 # 前置：系统已有 ffmpeg / ffprobe（实测 6.1.1）；本项目不 apt install、不装任何全局包
 make install     # = pip install -r requirements.txt（解释器自动探测，可用 PY= 覆盖）
 make run         # 前台启动（Ctrl+C 停止）；或 make run-bg 后台启动 + make stop 停止
-make test        # 79 项自动化测试（需要 make install-dev）
+make test        # 83 项自动化测试（需要 make install-dev）
 ```
 
 - **解释器**：`Makefile` 的 `PY` 会按「项目内 `.venv` → 作者的 conda 环境 `tin_ear` → `python3` → `python`」
@@ -535,7 +550,8 @@ make test        # 79 项自动化测试（需要 make install-dev）
   对"只用快速模式的人"代价太大，所以不做。
 - **生成按 CPU 核数并发**（`min(核数, 8)`，实测 22 题 15.3 s → 3.9 s）：单题 0.70 s 里 0.46 s 是
   我们自己的响度+对齐计算、0.25 s 是 ffmpeg 编解码，两者都能并行；8 路之后收益迅速变小（12 路 3.5 s），
-  所以封顶 8。并发带来的共享资源（`index.json` 读改写、同一素材的片段生成）各自加了锁。
+  所以封顶 8。并发带来的共享资源（`index.json` 读改写、同一素材的片段生成、共享无损文件的
+  「写 + 落盘自检」）各自加了锁，第三把的由来见 MEASUREMENTS.md §15.3。
 - **无损侧按内容共享，不按设置共享**：`delta == 0` 时同一片段的无损侧逐位相同，于是把文件名直接定为
   `seg{S}_ll.wav` 让全片段复用（MEASUREMENTS.md 实测 253.4 → 132.5 MB，−47.7%）。判据是**内容**（`common_delta`）
   而不是布局，所以不需要用户开关、不需要 bump 版本号，旧缓存条目的 `files.ll` 仍指向老文件名、照样命中；
@@ -592,7 +608,9 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
   顺序变化 / 安慰剂位置打散 / 每档题数）、二项检验与功效阈值、缓存复用计数、WAV 头规范（48 kHz / 2ch /
   720000 / 当前 `STIMULUS_SUBTYPE`，整数位深的头恰好 44 字节）、**落盘自检与其拒绝路径**、
   **无损侧共享的前提与回退**、选曲顺序不影响题表、并发与串行产物一致（比**解码后的样本**，理由见
-  MEASUREMENTS.md 的 `PEAK` chunk 坑）、并发数自适应、进度状态机与过期清理、共享锁的循环作用域、详细模式预热快速补集。
+  MEASUREMENTS.md 的 `PEAK` chunk 坑）、并发数自适应、进度状态机与过期清理、共享锁的循环作用域、
+  详细模式预热快速补集、**Windows 的 `os.replace` 重试与交付文件的「写/落盘自检」串行**
+  （见 MEASUREMENTS.md §15.3）。
 - `tests/test_api.py`：导入与去重（含带封面源）、有损格式拒绝、删除与 409（含"答完全部题目后即可删除"的
   回归）、题目参数校验、**防泄漏**、`reveal` 只在作答后返回且只含本题、首答即最终与幂等重放、安慰剂两路
   内容相同、带封面源的端到端出题、结果统计与结论文案、**静态资源强制重验证**、**试听音量滑条接线**、
@@ -611,8 +629,9 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 ## 15. 实测数据与实现记录
 
 **完整表格与记录在 [`MEASUREMENTS.md`](MEASUREMENTS.md)** —— 那一节是**查阅型**资料（改音频管线、更新体积
-口径、考古某个数字时才看），而本文件每次会话都要整份载入；拆开后 AGENTS.md 从 62.1 KB 降到 **57.2 KB**，
-离 64 KB 的加载预算有了余量（此前一度 66.6 KB，被截断过，丢的正好是 §16 的尾部）。
+口径、考古某个数字时才看），而本文件每次会话都要整份载入；拆开后 AGENTS.md 从 62.1 KB 降到 **57.2 KB**
+（修完 Windows 的 `os.replace` 之后是 **59.6 KB**），离 64 KB 的加载预算仍有约 4 KB 余量
+（此前一度 66.6 KB，被截断过，丢的正好是 §16 的尾部）。
 
 留在本节的关键数字（**细节与其余一切数字以 MEASUREMENTS.md 为准**）：
 
@@ -626,10 +645,11 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
 
 ## 16. 项目现状（交接摘要）
 
-- **状态**：功能完整可用。`make test` **79 项**全绿（约 1.4 分钟）。
+- **状态**：功能完整可用。`make test` **83 项**全绿（约 1.4 分钟）。
 - **改动历史**：看 `git log --oneline`。最近几轮依次是：缓存顺序无关 + 并发生成 + 进度条 + 术语改「测试音频」
   + 环境配置收敛 + 详细模式预热快速补集 + `python app.py` 一键启动 + **无损侧按内容共享**
-  + **交付位深 FLOAT → PCM_24** + **启动提示只给能打开的地址**。README/AGENTS 都已同步；
+  + **交付位深 FLOAT → PCM_24** + **启动提示只给能打开的地址**
+  + **修掉 Windows 真机上的 `os.replace` 拒绝访问（WinError 5）**。README/AGENTS 都已同步；
   历史上修过的真问题都在 MEASUREMENTS.md，不必从提交信息里考古。
 - **关键实测**：每对 ΔLUFS = 0.0000 LU、真峰值 ≈ −5.3 dBTP（−18 LUFS 下）、两路同为 **4,320,044 字节**（无体积泄漏）、
   22 题详细模式**串行 15.8 s / 8 路并发 3.9 s**、缓存复用 0.01 s、测试音频缓存 **103.3 MB/首**
@@ -639,6 +659,10 @@ make run-bg   # 后台起服务（日志 data/server.log），make stop 停止
   在真机上过了一遍；其余 20 条由 `make test` 持续守护（对照表见 §9）。验收 #1（安装即跑）现在由
   `python app.py` 这条命令覆盖，并有测试真的把子进程起起来探活。
   约定：**改前端（`static/`）或改测试音频内容之后，重新过一遍 #2** —— 那是唯一一条机器替不了的。
+  本次修 Windows `os.replace` 不需要重过 #2（既没动 `static/`，也没改音频内容）；但那条路径
+  **只有原生 Windows 才真正走得通**（结构化守护只能在 Linux 上证明"写与读自检不重叠"，
+  证明不了 `MoveFileEx` 的占用语义，见 MEASUREMENTS.md §15.3），所以下次在 Windows 上跑冷启动
+  `/api/start` 时顺带确认一次最稳妥。
 - **已定位并修掉的测试假阳性**：`test_question_does_not_leak_bitrate_or_codec` 曾约每十轮挂一次，
   现象是 `assert '96' not in '47398a8e90e79657'`。根因**不在产品代码**：不透明 token 是随机 16 位 hex，
   15 个两位窗口里出现 `96` 的概率实测 **5.74%**，而那条断言把"token 恰好含码率数字"误判成泄漏

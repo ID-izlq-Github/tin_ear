@@ -2,7 +2,8 @@
 
 > 本文件是 [AGENTS.md](AGENTS.md) §15 的主体，面向**维护者**。表里每个数字都是本机实测值；
 > **改音频管线、更新体积口径、或考古某个数字时看它**。之所以拆出来：这一节是查阅型资料，
-> 而 AGENTS.md 每次会话都要整份载入，拆开后它从 62.1 KB 降到 57.2 KB（原因详见 AGENTS.md §15）。
+
+> 而 AGENTS.md 每次会话都要整份载入，拆开后它从 62.1 KB 降到 57.2 KB（本轮再补 Windows `os.replace` 的记录后为 59.6 KB，原因详见 AGENTS.md §15）。
 > 文中出现的 `§N`、`#N` 均指 [AGENTS.md](AGENTS.md) 的章节与验收条目编号。
 
 ## 15.1 实测数据
@@ -50,3 +51,57 @@
 5. **浏览器缓存旧 `app.js`**：接口改名后旧脚本抛异常，而它抛异常前先把「查看答案」按钮 `hidden` 了，
    于是用户只看到"点了没反应"。修法是强制重验证 + `?v=N` + 揭晓函数任何分支都显示东西。
    > 教训：凡是"点了按钮但什么都没发生"的交互，函数里都不能有会抛异常的隐式假设。
+
+## 15.3 Windows 真机上的 `os.replace` 拒绝访问（WinError 5）
+
+**现象**（作者在原生 Windows 上跑 `python app.py` 时实测到的，WSL 下从未出现）：
+
+```
+POST /api/start HTTP/1.1" 500 Internal Server Error
+  File "...\app.py", line 960, in _ensure_stimuli
+    await asyncio.to_thread(_write_wav_atomic, path_ll, out_ll)
+  File "...\app.py", line 345, in _write_wav_atomic
+    os.replace(tmp, path)
+PermissionError: [WinError 5] 拒绝访问。:
+  '...\data\cache\60c978a6f2c100fe\stimuli\v3\.seg1_ll.wav.2cd4c848fd69.tmp'
+  -> '...\data\cache\60c978a6f2c100fe\stimuli\v3\seg1_ll.wav'
+```
+
+**根因**：`os.replace` 在 Windows 上走 `MoveFileEx(MOVEFILE_REPLACE_EXISTING)`，只要目标文件还有**别的句柄
+开着**（哪怕只是只读）就抛 `WinError 5` / `WinError 32`；POSIX 的 `rename` 完全允许替换一个正被打开的文件，
+所以这条路径在 WSL 下永远测不出来。触发它的是**并发生成**：`STIMULI_CONCURRENCY` 默认最多 8 路，而
+`seg{S}_ll.wav` 是同一片段**所有码率共用**的一份（§6 的按内容共享），于是同一片段的好几个码率任务同时
+写同一个路径 —— 一个任务刚写完就开始 `_verify_written_pair`（`sf.info` + `sf.read` **读**这个文件做落盘
+自检），另一个任务正好在这时 `os.replace` 它 → 拒绝访问。文件名是 `seg1_ll.wav`（共享无损侧）而不是
+`seg1_96k_mp3.wav`，正是这条共享路径的直接证据。
+
+**修法（两层）**：
+
+1. **根治**：`_STIMULUS_WRITE_LOCKS` + `_stimulus_write_lock(path)`，把「写文件 + 落盘自检」按**路径**串行；
+   取锁顺序按路径字符串排序（两个路径一次按住，反向加锁会死锁）。这样"读自检"和"替换"根本不会重叠。
+2. **兜底**：`_replace_with_retry` 对"被占用"做有限重试（`_REPLACE_RETRY_DELAYS` 合计约 1.6 s），
+   覆盖本进程控制不了的外部句柄（浏览器的 `FileResponse`、杀毒/索引器扫描、资源管理器预览）；
+   只对 `PermissionError` / `winerror ∈ {5, 32, 33}` 重试，真正的参数/权限错误一次就抛。
+   顺带把 `_write_json`、导入落库两处 `os.replace` 也换成它 —— 同一类竞态（`_ensure_stimuli` 在锁外
+   `_read_json(index.json)` 与别人替换它）在 Windows 上同样会 500。
+
+**顺带修掉的小毛病**：`_write_wav_atomic` / `_write_json` 替换最终失败时会把 `<name>.<token>.tmp`
+留在缓存目录里（旧代码没有 `finally` 清理）；现在失败即删。
+
+**守护测试**（`tests/test_pipeline.py`，Linux 上也能跑）：
+`test_write_wav_atomic_retries_windows_sharing_violation`（前两次 `PermissionError`、第三次成功）、
+`test_write_wav_atomic_gives_up_and_cleans_tmp`、`test_replace_with_retry_does_not_swallow_real_errors`、
+`test_shared_stimulus_write_and_verify_are_serialized` —— 最后一条是本根因的结构化守护：它把
+`_verify_written_pair` 的读窗口人为拉长（`sleep(0.05)`），若"写"与"读自检"发生重叠就记一笔。
+**实测把锁去掉后这条用例必然失败**（抓到重叠），加锁后恒为空 —— 所以它不是"在 Linux 上永远通过"的摆设。
+
+**旧版本残留**：跑过旧代码的机器，`data/cache/<audio_id>/stimuli/v3/` 里可能留着
+`.seg1_ll.wav.<token>.tmp`（每个 ≈ 4.3 MB，等于一条交付 WAV），直接删掉即可，
+不影响缓存（缺的条目会自动重算）。
+
+> 教训：`os.replace` / `os.rename` 不是跨平台等价的 —— 涉及"并发写同一路径 + 有人读它"的代码，
+> 在 WSL/macOS 上永远绿，到 Windows 才炸。要么让读写不重叠，要么对"被占用"重试，最好两者都做。
+
+> 复现/规避（给还不想升级代码的人）：`TINEAR_CONCURRENCY=1`（详见 §6 的 `_resolve_concurrency`）
+> 会把并发生成压成串行，进程内不再出现"一边读自检一边替换"，这条报错随之消失（代价是冷启动回到 ~15 s）。
+
